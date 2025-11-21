@@ -1,0 +1,3 @@
+[submodule "MTDetection"]
+	path = MTDetection
+	url = https://github.com/GidaiEECeTaniguchi/MTDetection
