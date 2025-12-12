@@ -92,8 +92,8 @@ def train_model(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_safetytensors=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, use_safetytensors=True).to(device)
 
     # データ読み込み
     en_list, ja_list = load_datasets(file_paths, max_samples=max_samples)
