@@ -11,7 +11,9 @@ import time
 # 1. データ読み込み
 # ===============================
 def load_datasets(file_paths, max_samples=None):
+    """複数 Jsonl データセットをまとめて読み込む"""
     en_list, ja_list = [], []
+    total_loaded = 0
 
     for path in file_paths:
         print(f"📖 Loading {path} ...")
@@ -23,11 +25,16 @@ def load_datasets(file_paths, max_samples=None):
                     if en and ja:
                         en_list.append(en)
                         ja_list.append(ja)
-                        if max_samples and len(en_list) >= max_samples:
+                        total_loaded += 1
+                        if max_samples and total_loaded >= max_samples:
                             print(f"⚡ Reached max_samples={max_samples}")
                             return en_list, ja_list
                 except json.JSONDecodeError:
                     continue
+
+    if len(en_list) == 0:
+        raise ValueError("No valid data loaded. Check your JSONL files.")
+    
     return en_list, ja_list
 
 # ===============================
