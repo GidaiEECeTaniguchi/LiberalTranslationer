@@ -182,7 +182,7 @@ def translate_text(model, tokenizer, texts, max_length=64, num_beams=4):
 # ===============================
 if __name__ == "__main__":
     files = [
-        "data/OpenSubtitles_40000.jsonl",
+        "data/OpenSubtitles_sample_40000.jsonl",
         "data/TED_sample_40000.jsonl",
         "data/Tatoeba_sample_40000.jsonl"
     ]
