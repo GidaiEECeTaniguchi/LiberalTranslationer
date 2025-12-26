@@ -1,4 +1,3 @@
-import random
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from torch.cuda.amp import autocast, GradScaler
@@ -42,12 +41,8 @@ def load_datasets(file_paths, max_samples=None):
 # ===============================
 # 2. Dataset クラス
 # ===============================
-# ===============================
-# TranslationDataset (変更箇所のみ)
-# ===============================
-
 class TranslationDataset(torch.utils.data.Dataset):
-    def __init__(self, en_list, ja_list, tokenizer, max_len=64, max_k=20, hist_size=10):
+    def __init__(self, en_list, ja_list, tokenizer, max_len=64, max_k=5, hist_size=10):
         self.en = en_list
         self.ja = ja_list
         self.tok = tokenizer
@@ -55,15 +50,21 @@ class TranslationDataset(torch.utils.data.Dataset):
         self.max_k = max_k
         self.add_prefix = hasattr(tokenizer, 'supported_language_codes')
 
-        # 重複抑制用の履歴（idx ごとに最近使った区間を記録）
+        # 重複抑制履歴
         self.recent_intervals = {i: [] for i in range(len(en_list))}
         self.hist_size = hist_size
 
+   
+    def __len__(self):
+        return len(self.en)
+
     def __getitem__(self, idx):
+        import random
+
         L = len(self.en)
         tried = self.recent_intervals[idx]
 
-        # 最近と被らない区間を選ぶ（最大10回試す）
+        # 最近と被らない区間を最大10回探索
         for _ in range(10):
             k = random.randint(1, self.max_k)
 
@@ -74,19 +75,80 @@ class TranslationDataset(torch.utils.data.Dataset):
             if cand not in tried:
                 break
 
-        # 履歴更新
         tried.append(cand)
         if len(tried) > self.hist_size:
             tried.pop(0)
 
-        # 結合（区切り情報無しでそのまま）
         src = "".join(self.en[left:right])
         tgt = "".join(self.ja[left:right])
 
-        # 以下は元コードと同じ
         if self.add_prefix:
             src = ">>jap<< " + src
 
+        src_tok = self.tok(src, max_length=self.max_len, truncation=True,
+                           padding="max_length", return_tensors="pt")
+        tgt_tok = self.tok(text_target=tgt, max_length=self.max_len,
+                           truncation=True, padding="max_length",
+                           return_tensors="pt")
+
+        labels = tgt_tok["input_ids"].clone()
+        labels[labels == self.tok.pad_token_id] = -100
+
+        return {
+            "input_ids": src_tok["input_ids"].squeeze(),
+            "attention_mask": src_tok["attention_mask"].squeeze(),
+            "labels": labels.squeeze(),
+        }
+
+
+
+class TranslationDatasetByWork(torch.utils.data.Dataset):
+    def __init__(self, en_list, ja_list, tokenizer, max_len=1024,
+                 sep_en="%%%%%%%%THISWORKENDSHERE%%%%%%%%",
+                 sep_ja="%%%%%%%%この作品ここまで%%%%%%%%"):
+        self.tok = tokenizer
+        self.max_len = max_len
+        self.sep_en = sep_en
+        self.sep_ja = sep_ja
+        self.add_prefix = hasattr(tokenizer, 'supported_language_codes')
+
+        # ---- ここで作品単位にまとめる ----
+        self.en_works = []
+        self.ja_works = []
+
+        cur_en = []
+        cur_ja = []
+
+        for en, ja in zip(en_list, ja_list):
+            if en == self.sep_en and ja == self.sep_ja:
+                # 作品終了 → バッファを固めて保存
+                if cur_en and cur_ja:
+                    self.en_works.append(" ".join(cur_en))
+                    self.ja_works.append(" ".join(cur_ja))
+                cur_en = []
+                cur_ja = []
+            else:
+                cur_en.append(en)
+                cur_ja.append(ja)
+
+        # 最後に作品が終わらず残った場合
+        if cur_en and cur_ja:
+            self.en_works.append(" ".join(cur_en))
+            self.ja_works.append(" ".join(cur_ja))
+
+    def __len__(self):
+        return len(self.en_works)
+
+    def __getitem__(self, idx):
+        src = self.en_works[idx]
+        tgt = self.ja_works[idx]
+
+        # 翻訳先言語指定が必要な模型の場合（OPUS系など）
+        if self.add_prefix:
+            src = ">>jap<< " + src
+
+        # ---- トークナイズ ----
+        # （max_len=256 くらいにしないと作品が切れるので注意）
         src_tok = self.tok(src, max_length=self.max_len, truncation=True,
                            padding="max_length", return_tensors="pt")
 
@@ -262,10 +324,15 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
 # ===============================
 if __name__ == "__main__":
     files = [
+        "./data/sepalated_dataset.jsonl"
+        
+    ]
+    '''
         "./data/OpenSubtitles_sample_40000.jsonl",
         "./data/TED_sample_40000.jsonl",
         "./data/Tatoeba_sample_40000.jsonl"
-    ]
+        "./data/all_outenjp.jsonl"
+    '''
     MODEL_NAME = "Helsinki-NLP/opus-mt-en-jap"
     SAVE_DIR = "./models/translation_model_jsonl"
     
@@ -274,7 +341,7 @@ if __name__ == "__main__":
         files,
         epochs=2,
         batch_size=16,
-        max_samples=120000,  # 3ファイル x 40000
+        max_samples=10000,  # 3ファイル x 40000
         save_dir=SAVE_DIR
     )
     
