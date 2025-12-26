@@ -334,15 +334,14 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
 # ===============================
 if __name__ == "__main__":
     files = [
-        "./../data/sepalated_dataset.jsonl"
+        "./../data/sepalated_dataset.jsonl",
+        "./../data/OpenSubtitles_sample_40000.jsonl",
+        "./../data/TED_sample_40000.jsonl",
+        "./../data/Tatoeba_sample_40000.jsonl"
+        "./../data/all_outenjp.jsonl"
         
     ]
-    '''
-        "./data/OpenSubtitles_sample_40000.jsonl",
-        "./data/TED_sample_40000.jsonl",
-        "./data/Tatoeba_sample_40000.jsonl"
-        "./data/all_outenjp.jsonl"
-    '''
+
     MODEL_NAME = "Helsinki-NLP/opus-mt-en-jap"
     SAVE_DIR = "./models/translation_model_jsonl"
     
