@@ -3,6 +3,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
+import random
 
 import os
 from pathlib import Path
@@ -11,37 +12,87 @@ import json
 # ===============================
 # 1. データ読み込み (JSONL対応)
 # ===============================
-def load_datasets(file_paths, max_samples=None):
-    """複数JSONLデータセットを読み込み、英語と日本語のペアを返す"""
+def load_single_dataset(file_path, max_samples=None):
+    """単一JSONLファイルを読み込み"""
     en_list, ja_list = [], []
-    total_loaded = 0
-
-    for path in file_paths:
-        print(f"📖 Loading {path} ...")
-        with open(path, "r", encoding="utf-8") as f:
-            for line in tqdm(f, desc=f"Reading {os.path.basename(path)}", unit=" lines"):
-                try:
-                    data = json.loads(line)
-                    en, ja = data.get("en"), data.get("ja")
-                    if en and ja:
-                        en_list.append(en)
-                        ja_list.append(ja)
-                        total_loaded += 1
-                        if max_samples and total_loaded >= max_samples:
-                            print(f"⚡ Reached max_samples={max_samples}")
-                            return en_list, ja_list
-                except json.JSONDecodeError:
-                    continue
-
-    if len(en_list) == 0:
-        raise ValueError("No valid data loaded. Check your JSONL files.")
     
+    print(f"📖 Loading {file_path} ...")
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        
+        # max_samplesが指定されている場合はランダムサンプリング
+        if max_samples and len(lines) > max_samples:
+            print(f"  ⚡ Sampling {max_samples} from {len(lines)} lines")
+            lines = random.sample(lines, max_samples)
+        
+        for line in tqdm(lines, desc=f"Reading {os.path.basename(file_path)}", unit=" lines"):
+            try:
+                data = json.loads(line)
+                en, ja = data.get("en"), data.get("ja")
+                if en and ja:
+                    en_list.append(en)
+                    ja_list.append(ja)
+            except json.JSONDecodeError:
+                continue
+    
+    print(f"  ✅ Loaded {len(en_list)} pairs from {os.path.basename(file_path)}")
     return en_list, ja_list
+
+
+def load_datasets_balanced(file_paths, max_samples_per_type=None):
+    """
+    ByWork系とRandomSpan系を分けて、それぞれから適切にサンプリング
+    
+    Args:
+        file_paths: ファイルパスのリスト
+        max_samples_per_type: RandomSpan系の各ファイルから取得する最大サンプル数
+                             (ByWork系は全て使用)
+    
+    Returns:
+        bywork_files: [(file_path, en_list, ja_list), ...]
+        span_files: [(file_path, en_list, ja_list), ...]
+    """
+    bywork_files = []
+    span_files = []
+    
+    for fp in file_paths:
+        is_bywork = "separated" in Path(fp).name or "sepalated" in Path(fp).name
+        
+        if is_bywork:
+            # ByWork系は全て読み込む
+            print(f"\n🎯 [WORK-LEVEL] {fp} (loading ALL)")
+            en_list, ja_list = load_single_dataset(fp, max_samples=None)
+            bywork_files.append((fp, en_list, ja_list))
+        else:
+            # RandomSpan系はmax_samples_per_type分だけ
+            print(f"\n🎲 [SPAN-LEVEL] {fp}")
+            en_list, ja_list = load_single_dataset(fp, max_samples=max_samples_per_type)
+            span_files.append((fp, en_list, ja_list))
+    
+    # サマリー表示
+    print("\n" + "="*60)
+    print("📊 LOADING SUMMARY")
+    print("="*60)
+    
+    total_bywork = sum(len(data[1]) for data in bywork_files)
+    print(f"ByWork datasets: {len(bywork_files)} files, {total_bywork:,} pairs total")
+    for fp, en_list, _ in bywork_files:
+        print(f"  - {os.path.basename(fp)}: {len(en_list):,} pairs")
+    
+    total_span = sum(len(data[1]) for data in span_files)
+    print(f"\nRandomSpan datasets: {len(span_files)} files, {total_span:,} pairs total")
+    for fp, en_list, _ in span_files:
+        print(f"  - {os.path.basename(fp)}: {len(en_list):,} pairs")
+    
+    print(f"\n🎉 GRAND TOTAL: {total_bywork + total_span:,} pairs")
+    print("="*60 + "\n")
+    
+    return bywork_files, span_files
 
 # ===============================
 # 2. Dataset クラス
 # ===============================
-
+from torch.utils.data import Dataset
 
 class TranslationDatasetRandomSpan(Dataset):
     def __init__(self, en_list, ja_list, tokenizer, max_len=128,
@@ -132,12 +183,11 @@ class TranslationDatasetByWork(torch.utils.data.Dataset):
         src = self.en_works[idx]
         tgt = self.ja_works[idx]
 
-        # 翻訳先言語指定が必要な模型の場合（OPUS系など）
+        # 翻訳先言語指定が必要なモデルの場合(OPUS系など)
         if self.add_prefix:
             src = ">>jap<< " + src
 
         # ---- トークナイズ ----
-        # （max_len=256 くらいにしないと作品が切れるので注意）
         src_tok = self.tok(src, max_length=self.max_len, truncation=True,
                            padding="max_length", return_tensors="pt")
 
@@ -155,25 +205,43 @@ class TranslationDatasetByWork(torch.utils.data.Dataset):
         }
 
 
-def build_combined_dataset(file_paths, tokenizer, max_len=256):
+def build_combined_dataset(file_paths, tokenizer, max_len=256, 
+                          max_samples_per_span_file=None):
+    """
+    ByWork系とRandomSpan系を適切にサンプリングして結合
+    
+    Args:
+        file_paths: ファイルパスのリスト
+        tokenizer: トークナイザー
+        max_len: 最大トークン長
+        max_samples_per_span_file: RandomSpan系の各ファイルから取る最大サンプル数
+    """
+    # データ読み込み (バランス調整済み)
+    bywork_files, span_files = load_datasets_balanced(
+        file_paths, 
+        max_samples_per_type=max_samples_per_span_file
+    )
+    
     datasets = []
-
-    for fp in file_paths:
-        en_list, ja_list = load_datasets([fp])  # 既存関数で読み込み
-
-        # ファイル名判定
-        if "separated" in Path(fp).name:
-            print(f"[WORK-LEVEL] {fp}")
-            ds = TranslationDatasetByWork(en_list, ja_list, tokenizer, max_len=max_len)
-        else:
-            print(f"[SPAN-LEVEL] {fp}")
-            ds = TranslationDatasetRandomSpan(en_list, ja_list, tokenizer, max_len=max_len)
-
+    
+    # ByWork系のデータセット作成
+    for fp, en_list, ja_list in bywork_files:
+        ds = TranslationDatasetByWork(en_list, ja_list, tokenizer, max_len=max_len)
         datasets.append(ds)
-
+        print(f"✅ Created ByWork dataset from {os.path.basename(fp)}: {len(ds)} works")
+    
+    # RandomSpan系のデータセット作成
+    for fp, en_list, ja_list in span_files:
+        ds = TranslationDatasetRandomSpan(en_list, ja_list, tokenizer, max_len=max_len)
+        datasets.append(ds)
+        print(f"✅ Created RandomSpan dataset from {os.path.basename(fp)}: {len(ds)} pairs")
+    
     # 複数 dataset を連結
     from torch.utils.data import ConcatDataset
-    return ConcatDataset(datasets)
+    combined = ConcatDataset(datasets)
+    print(f"\n🎯 Combined dataset total size: {len(combined)}")
+    
+    return combined
 
 # ===============================
 # 3. 検証関数
@@ -222,7 +290,7 @@ def train_model(
     epochs=3,
     batch_size=32,
     use_amp=True,
-    max_samples=None,
+    max_samples_per_span_file=None,  # RandomSpan系の各ファイルからの最大サンプル数
     val_split=0.05,
     save_dir="./models",
     learning_rate=1e-4,
@@ -237,13 +305,24 @@ def train_model(
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_safetensors=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, use_safetensors=True).to(device)
     
-    en_list, ja_list = load_datasets(file_paths, max_samples=max_samples)
-    print(f"✅ Loaded {len(en_list)} translation pairs")
+    # 改善されたデータセット構築
+    dataset = build_combined_dataset(
+        file_paths, 
+        tokenizer, 
+        max_len=max_len,
+        max_samples_per_span_file=max_samples_per_span_file
+    )
     
-    dataset = TranslationDataset(en_list, ja_list, tokenizer, max_len=max_len)
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    train_dataset, val_dataset = random_split(
+        dataset, [train_size, val_size], 
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    print(f"\n📊 Dataset split:")
+    print(f"  Training: {train_size:,} samples")
+    print(f"  Validation: {val_size:,} samples\n")
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size*2, shuffle=False)
@@ -334,23 +413,22 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
 # ===============================
 if __name__ == "__main__":
     files = [
-        "./../data/sepalated_dataset.jsonl",
-        "./../data/OpenSubtitles_sample_40000.jsonl",
-        "./../data/TED_sample_40000.jsonl",
-        "./../data/Tatoeba_sample_40000.jsonl"
-        "./../data/all_outenjp.jsonl"
-        
+        "./../data/sepalated_dataset.jsonl",           # ByWork系
+        "./../data/OpenSubtitles_sample_40000.jsonl",  # RandomSpan系
+        "./../data/TED_sample_40000.jsonl",            # RandomSpan系
+        "./../data/Tatoeba_sample_40000.jsonl",        # RandomSpan系
+        "./../data/all_outenjp.jsonl"                  # RandomSpan系 
     ]
-
+   
     MODEL_NAME = "Helsinki-NLP/opus-mt-en-jap"
-    SAVE_DIR = "./models/translation_model_jsonl"
+    SAVE_DIR = "./models/translation_model_balanced"
     
     model, tokenizer = train_model(
         MODEL_NAME,
         files,
         epochs=2,
         batch_size=16,
-        max_samples=1000,  # 3ファイル x 40000
+        max_samples_per_span_file=40000,  # RandomSpan系は各ファイル40000件まで
         save_dir=SAVE_DIR
     )
     
