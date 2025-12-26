@@ -41,46 +41,36 @@ def load_datasets(file_paths, max_samples=None):
 # ===============================
 # 2. Dataset クラス
 # ===============================
-class TranslationDataset(torch.utils.data.Dataset):
-    def __init__(self, en_list, ja_list, tokenizer, max_len=64, max_k=5, hist_size=10):
+
+
+class TranslationDatasetRandomSpan(Dataset):
+    def __init__(self, en_list, ja_list, tokenizer, max_len=128,
+                 multi_prob=0.4,   # 複数文にする確率
+                 max_k=4):         # 最大何文くっつけるか
         self.en = en_list
         self.ja = ja_list
         self.tok = tokenizer
         self.max_len = max_len
+        self.multi_prob = multi_prob
         self.max_k = max_k
         self.add_prefix = hasattr(tokenizer, 'supported_language_codes')
 
-        # 重複抑制履歴
-        self.recent_intervals = {i: [] for i in range(len(en_list))}
-        self.hist_size = hist_size
-
-   
     def __len__(self):
         return len(self.en)
 
     def __getitem__(self, idx):
-        import random
-
         L = len(self.en)
-        tried = self.recent_intervals[idx]
 
-        # 最近と被らない区間を最大10回探索
-        for _ in range(10):
+        # --- 文対文 or 複数文 ---
+        if random.random() < self.multi_prob:
             k = random.randint(1, self.max_k)
-
             left = max(0, idx - random.randint(0, k))
             right = min(L, idx + random.randint(1, k + 1))
+        else:
+            left, right = idx, idx + 1
 
-            cand = (left, right)
-            if cand not in tried:
-                break
-
-        tried.append(cand)
-        if len(tried) > self.hist_size:
-            tried.pop(0)
-
-        src = "".join(self.en[left:right])
-        tgt = "".join(self.ja[left:right])
+        src = " ".join(self.en[left:right])
+        tgt = " ".join(self.ja[left:right])
 
         if self.add_prefix:
             src = ">>jap<< " + src
@@ -99,7 +89,6 @@ class TranslationDataset(torch.utils.data.Dataset):
             "attention_mask": src_tok["attention_mask"].squeeze(),
             "labels": labels.squeeze(),
         }
-
 
 
 class TranslationDatasetByWork(torch.utils.data.Dataset):
@@ -164,6 +153,27 @@ class TranslationDatasetByWork(torch.utils.data.Dataset):
             "attention_mask": src_tok["attention_mask"].squeeze(),
             "labels": labels.squeeze(),
         }
+
+
+def build_combined_dataset(file_paths, tokenizer, max_len=256):
+    datasets = []
+
+    for fp in file_paths:
+        en_list, ja_list = load_datasets([fp])  # 既存関数で読み込み
+
+        # ファイル名判定
+        if "separated" in Path(fp).name:
+            print(f"[WORK-LEVEL] {fp}")
+            ds = TranslationDatasetByWork(en_list, ja_list, tokenizer, max_len=max_len)
+        else:
+            print(f"[SPAN-LEVEL] {fp}")
+            ds = TranslationDatasetRandomSpan(en_list, ja_list, tokenizer, max_len=max_len)
+
+        datasets.append(ds)
+
+    # 複数 dataset を連結
+    from torch.utils.data import ConcatDataset
+    return ConcatDataset(datasets)
 
 # ===============================
 # 3. 検証関数
@@ -324,7 +334,7 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
 # ===============================
 if __name__ == "__main__":
     files = [
-        "./data/sepalated_dataset.jsonl"
+        "./../data/sepalated_dataset.jsonl"
         
     ]
     '''
@@ -341,7 +351,7 @@ if __name__ == "__main__":
         files,
         epochs=2,
         batch_size=16,
-        max_samples=10000,  # 3ファイル x 40000
+        max_samples=1000,  # 3ファイル x 40000
         save_dir=SAVE_DIR
     )
     
