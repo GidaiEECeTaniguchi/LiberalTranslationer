@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 import random
-from torch.utils.data import Dataset,Subset
+from torch.utils.data import Dataset, Subset
 import os
 from pathlib import Path
 import json
@@ -14,6 +14,7 @@ import logging
 # ロギング設定
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ===============================
 # 1. メモリ効率的なデータ読み込み
@@ -48,8 +49,8 @@ def load_single_dataset_streaming(file_path, max_samples=None, random_seed=42, t
                 selected_indices = set(random.sample(range(total_lines), max_samples))
                 
                 # 選択された行だけを処理
-                for idx, line in enumerate(tqdm(f, total=total_lines, 
-                                                desc=f"Reading {os.path.basename(file_path)}", 
+                for idx, line in enumerate(tqdm(f, total=total_lines,
+                                                desc=f"Reading {os.path.basename(file_path)}",
                                                 unit=" lines")):
                     if idx in selected_indices:
                         try:
@@ -66,8 +67,8 @@ def load_single_dataset_streaming(file_path, max_samples=None, random_seed=42, t
             else:
                 # 全行を処理
                 f.seek(0)
-                for line in tqdm(f, total=total_lines, 
-                               desc=f"Reading {os.path.basename(file_path)}", 
+                for line in tqdm(f, total=total_lines,
+                               desc=f"Reading {os.path.basename(file_path)}",
                                unit=" lines"):
                     try:
                         data = json.loads(line)
@@ -166,32 +167,34 @@ def load_datasets_balanced(file_paths, max_samples_per_type=None, random_seed=42
 def build_randomspan_collator(tokenizer, label_smoothing=0.1):
     return DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
-        model=None,                     # loss は model 側で
+        model=None,  # loss は model 側で
         padding="longest",
         label_pad_token_id=-100,
-        pad_to_multiple_of=8            # TensorCore 効率
+        pad_to_multiple_of=8  # TensorCore 効率
     )
+
+
 def split_concat_dataset(dataset):
     bywork_indices = []
     span_indices = []
 
     for i, ds in enumerate(dataset.datasets):
         if isinstance(ds, TranslationDatasetByWorkMemoryEfficient):
-            bywork_indices.extend(range(dataset.cumulative_sizes[i-1] if i > 0 else 0,
+            bywork_indices.extend(range(dataset.cumulative_sizes[i - 1] if i > 0 else 0,
                                          dataset.cumulative_sizes[i]))
         else:
-            span_indices.extend(range(dataset.cumulative_sizes[i-1] if i > 0 else 0,
+            span_indices.extend(range(dataset.cumulative_sizes[i - 1] if i > 0 else 0,
                                        dataset.cumulative_sizes[i]))
 
     return bywork_indices, span_indices
 
 
-
 class TranslationDatasetRandomSpan(Dataset):
     """ランダムスパンデータセット"""
+
     def __init__(self, en_list, ja_list, tokenizer, max_len=128,
-                 multi_prob=0.4,   # 複数文にする確率
-                 max_k=4):         # 最大何文くっつけるか
+                 multi_prob=0.4,  # 複数文にする確率
+                 max_k=4):  # 最大何文くっつけるか
         self.en = en_list
         self.ja = ja_list
         self.tok = tokenizer
@@ -239,7 +242,6 @@ class TranslationDatasetRandomSpan(Dataset):
         self.multi_prob = max(0.0, min(1.0, value))
 
 
-
 class TranslationDatasetByWorkMemoryEfficient(torch.utils.data.Dataset):
     """
     メモリ効率的なByWorkデータセット
@@ -248,6 +250,7 @@ class TranslationDatasetByWorkMemoryEfficient(torch.utils.data.Dataset):
     1. __init__で全作品をメモリに展開せず、インデックスと位置情報のみ保持
     2. __getitem__で必要な時に必要な作品だけを構築
     """
+
     def __init__(self, en_list, ja_list, tokenizer, max_len=1024,
                  sep_en="%%%%%%%%THISWORKENDSHERE%%%%%%%%",
                  sep_ja="%%%%%%%%この作品ここまで%%%%%%%%"):
@@ -307,7 +310,7 @@ class TranslationDatasetByWorkMemoryEfficient(torch.utils.data.Dataset):
         }
 
 
-def build_combined_dataset(file_paths, tokenizer, max_len=256, 
+def build_combined_dataset(file_paths, tokenizer, max_len=256,
                           max_samples_per_span_file=None, random_seed=42, tags=None):
     """
     ByWork系とRandomSpan系を適切にサンプリングして結合
@@ -322,7 +325,7 @@ def build_combined_dataset(file_paths, tokenizer, max_len=256,
     """
     # データ読み込み (バランス調整済み)
     bywork_files, span_files = load_datasets_balanced(
-        file_paths, 
+        file_paths,
         max_samples_per_type=max_samples_per_span_file,
         random_seed=random_seed,
         tags=tags
@@ -349,6 +352,7 @@ def build_combined_dataset(file_paths, tokenizer, max_len=256,
     
     return combined
 
+
 # ===============================
 # 3. 検証関数
 # ===============================
@@ -364,10 +368,12 @@ def evaluate_model(model, val_loader, device):
             total_loss += outputs.loss.item()
     return total_loss / len(val_loader)
 
+
 # ===============================
 # 4. Early Stopping
 # ===============================
 class EarlyStopping:
+
     def __init__(self, patience=3, min_delta=0.001):
         self.patience = patience
         self.min_delta = min_delta
@@ -388,13 +394,14 @@ class EarlyStopping:
             self.counter = 0
 
 
-
 def freeze_encoder_layers(model, ratio=0.5):
     enc_layers = model.model.encoder.layers
     freeze_until = int(len(enc_layers) * ratio)
     for i, layer in enumerate(enc_layers):
         for p in layer.parameters():
             p.requires_grad = i >= freeze_until
+
+
 # ===============================
 # 5. 高速化された学習関数
 # ===============================
@@ -415,12 +422,12 @@ def train_model(
     random_seed=42,
     tags=None,
     # 🆕 高速化パラメータ
-    num_workers=4,              # DataLoaderのワーカー数
-    accumulation_steps=4,       # Gradient Accumulation
-    use_bfloat16=True,          # BFloat16を使用するか
-    use_compile=True,           # torch.compileを使用するか
+    num_workers=4,  # DataLoaderのワーカー数
+    accumulation_steps=4,  # Gradient Accumulation
+    use_bfloat16=True,  # BFloat16を使用するか
+    use_compile=True,  # torch.compileを使用するか
     scheduler_type='onecycle',  # 'onecycle' or 'linear_warmup'
-    warmup_steps=500            # linear_warmup用のウォームアップステップ数
+    warmup_steps=500  # linear_warmup用のウォームアップステップ数
 ):
     """
     最適化された学習関数
@@ -467,8 +474,8 @@ def train_model(
     """
     # データセット構築
     dataset = build_combined_dataset(
-        file_paths, 
-        tokenizer, 
+        file_paths,
+        tokenizer,
         max_len=max_len,
         max_samples_per_span_file=max_samples_per_span_file,
         random_seed=random_seed,
@@ -481,11 +488,23 @@ def train_model(
         generator=torch.Generator().manual_seed(random_seed)
     )
 
-    bywork_idx, span_idx = split_concat_dataset(train_dataset)
+    # まず ConcatDataset 全体から index を作る
+    bywork_idx, span_idx = split_concat_dataset(dataset)
 
-    train_bywork = Subset(train_dataset, bywork_idx)
-    train_span   = Subset(train_dataset, span_idx)
+    # 次に train / val 分割
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(random_seed)
+    )
+    train_indices = set(train_dataset.indices)
 
+    train_bywork_idx = [i for i in bywork_idx if i in train_indices]
+    train_span_idx = [i for i in span_idx   if i in train_indices]
+
+    train_bywork = Subset(dataset, train_bywork_idx)
+    train_span = Subset(dataset, train_span_idx)
     
     logger.info(f"\n📊 Dataset split:")
     logger.info(f"  Training: {train_size:,} samples")
@@ -493,12 +512,12 @@ def train_model(
     
     # 🆕 DataLoaderの最適化
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
+        train_dataset,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,        # マルチプロセス読み込み
-        pin_memory=True,                # GPU転送の高速化
-        prefetch_factor=2,              # 先読みバッファ
+        num_workers=num_workers,  # マルチプロセス読み込み
+        pin_memory=True,  # GPU転送の高速化
+        prefetch_factor=2,  # 先読みバッファ
         persistent_workers=True if num_workers > 0 else False  # ワーカープロセスを維持
     )
 
@@ -522,11 +541,10 @@ def train_model(
         pin_memory=True,
         persistent_workers=True
     )
-
     
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size*2, 
+        val_dataset,
+        batch_size=batch_size * 2,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
@@ -544,10 +562,10 @@ def train_model(
             optimizer,
             max_lr=learning_rate * 10,  # 最大学習率
             total_steps=total_steps,
-            pct_start=0.3,              # ウォームアップの割合
+            pct_start=0.3,  # ウォームアップの割合
             anneal_strategy='cos',
-            div_factor=25.0,            # 初期学習率 = max_lr / div_factor
-            final_div_factor=1e4        # 最終学習率 = max_lr / final_div_factor
+            div_factor=25.0,  # 初期学習率 = max_lr / div_factor
+            final_div_factor=1e4  # 最終学習率 = max_lr / final_div_factor
         )
         logger.info(f"📈 OneCycleLR scheduler initialized (total_steps={total_steps})")
     elif scheduler_type == 'linear_warmup':
@@ -586,60 +604,72 @@ def train_model(
         loaders = [train_loader_span, train_loader_bywork]
         for loader in loaders:
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
-        
+
             for batch_idx, batch in enumerate(pbar):
-                # 最初のバッチまたはaccumulationの最初で勾配をゼロ化
+
+                # accumulation の先頭で zero_grad
                 if batch_idx % accumulation_steps == 0:
-                    optimizer.zero_grad()
-            
+                    optimizer.zero_grad(set_to_none=True)
+
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
-            
-                # 🆕 BFloat16対応の混合精度学習
+
                 if use_bf16:
-                    # BFloat16を使用
                     with autocast(dtype=torch.bfloat16):
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                        loss = outputs.loss / accumulation_steps  # 🆕 Gradient Accumulation用にスケーリング
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels
+                        )
+                        loss = outputs.loss / accumulation_steps
                     loss.backward()
+
                 elif scaler:
-                    # FP16を使用
                     with autocast():
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels
+                        )
                         loss = outputs.loss / accumulation_steps
                     scaler.scale(loss).backward()
+
                 else:
-                    # FP32を使用
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
                     loss = outputs.loss / accumulation_steps
                     loss.backward()
-            
-            # 🆕 Gradient Accumulation: 指定ステップごとにパラメータ更新
+
+                # ★ ここから「更新フェーズ」
                 if (batch_idx + 1) % accumulation_steps == 0:
+
                     if gradient_clip > 0:
                         if scaler:
                             scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                
+
                     if scaler:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
-                
-                # 🆕 スケジューラのステップ (optimizer.step()の後に呼ぶ)
+
                     if scheduler:
                         scheduler.step()
-            
-                total_loss += loss.item() * accumulation_steps  # 元のスケールに戻す
-            
-            # 現在の学習率を表示
-                current_lr = optimizer.param_groups[0]['lr']
-                pbar.set_postfix({
-                    "loss": f"{loss.item() * accumulation_steps:.4f}",
-                    "lr": f"{current_lr:.2e}"
-                })
+
+                # ★ ログ用損失は毎バッチ
+                total_loss += loss.item() * accumulation_steps
+
+                current_lr = optimizer.param_groups[0]["lr"]
+                pbar.set_postfix(
+                    loss=f"{loss.item() * accumulation_steps:.4f}",
+                    lr=f"{current_lr:.2e}"
+                )
+
         if epoch == 1:
             for p in model.parameters():
                 p.requires_grad = True
@@ -659,11 +689,9 @@ def train_model(
         if early_stopping.early_stop:
             logger.info(f"🛑 Early stopping triggered at epoch {epoch+1}")
             break
-
     
     logger.info(f"\n✅ Training completed! Best validation loss: {best_val_loss:.4f}")
     return model, tokenizer
-
 
 
 # ===============================
@@ -679,13 +707,14 @@ def translate(model, tokenizer, text, max_length=64, num_beams=4):
         outputs = model.generate(**inputs, max_length=max_length, num_beams=num_beams)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+
 def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_beams=4):
     device = next(model.parameters()).device
     if hasattr(tokenizer, 'supported_language_codes'):
         texts = [">>jap<< " + t for t in texts]
     translations = []
     for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
+        batch_texts = texts[i:i + batch_size]
         inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
@@ -693,16 +722,17 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
         translations.extend([tokenizer.decode(o, skip_special_tokens=True) for o in outputs])
     return translations
 
+
 # ===============================
 # 実行例
 # ===============================
 if __name__ == "__main__":
     files = [
-        "./../data/sepalated_dataset.jsonl",           # ByWork系
+        "./../data/sepalated_dataset.jsonl",  # ByWork系
         "./../data/OpenSubtitles_sample_40000.jsonl",  # RandomSpan系
-        "./../data/TED_sample_40000.jsonl",            # RandomSpan系
-        "./../data/Tatoeba_sample_40000.jsonl",        # RandomSpan系
-        "./../data/all_outenjp.jsonl"                  # RandomSpan系 (歌詞など)
+        "./../data/TED_sample_40000.jsonl",  # RandomSpan系
+        "./../data/Tatoeba_sample_40000.jsonl",  # RandomSpan系
+        "./../data/all_outenjp.jsonl"  # RandomSpan系 (歌詞など)
     ]
     
     # 🆕 各ファイルに対応するタグ (必要に応じて設定)
@@ -750,8 +780,8 @@ if __name__ == "__main__":
     # )
     
     test_sentences = [
-        "I like apples.", 
-        "How are you?", 
+        "I like apples.",
+        "How are you?",
         "Machine learning is fun.",
         "I couldn't speak English well."
     ]
