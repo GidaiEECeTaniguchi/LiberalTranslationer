@@ -10,10 +10,39 @@ import os
 from pathlib import Path
 import json
 import logging
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ===============================
+# 0. 設定クラス
+# ===============================
+@dataclass
+class TrainingConfig:
+    model_name: str
+    file_paths: List[str]
+    epochs: int = 3
+    batch_size: int = 32
+    use_amp: bool = True
+    max_samples_per_span_file: Optional[int] = None
+    val_split: float = 0.05
+    save_dir: str = "./models"
+    learning_rate: float = 1e-4
+    gradient_clip: float = 1.0
+    patience: int = 2
+    max_len: int = 64
+    random_seed: int = 42
+    tags: Optional[List[str]] = None
+    num_workers: int = 4
+    accumulation_steps: int = 4
+    use_bfloat16: bool = True
+    use_compile: bool = False  # torch.compileは互換性問題があるためデフォルトOFF
+    scheduler_type: str = 'onecycle'
+    warmup_steps: int = 500
 
 
 # ===============================
@@ -403,287 +432,187 @@ def freeze_encoder_layers(model, ratio=0.5):
 
 
 # ===============================
-# 5. 高速化された学習関数
+# 5. リファクタリングされた学習関数群
 # ===============================
-def train_model(
-    model_name,
-    file_paths,
-    epochs=3,
-    batch_size=32,
-    use_amp=True,
-    max_samples_per_span_file=None,
-    val_split=0.05,
-    save_dir="./models",
-    learning_rate=1e-4,
-    gradient_clip=1.0,
-    save_every=1,
-    patience=2,
-    max_len=64,
-    random_seed=42,
-    tags=None,
-    # 🆕 高速化パラメータ
-    num_workers=4,  # DataLoaderのワーカー数
-    accumulation_steps=4,  # Gradient Accumulation
-    use_bfloat16=True,  # BFloat16を使用するか
-    use_compile=True,  # torch.compileを使用するか
-    scheduler_type='onecycle',  # 'onecycle' or 'linear_warmup'
-    warmup_steps=500  # linear_warmup用のウォームアップステップ数
-):
-    """
-    最適化された学習関数
-    
-    Args:
-        scheduler_type: 'onecycle' (OneCycleLR) または 'linear_warmup' (get_linear_schedule_with_warmup)
-        warmup_steps: linear_warmup使用時のウォームアップステップ数
-    """
+
+def setup_training(config: TrainingConfig):
+    """デバイス、ロギング、トークナイザ、モデルの初期化"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"🚀 Using device: {device}")
     
-    # 🆕 高速化設定のログ出力
-    logger.info("\n" + "="*60)
-    logger.info("⚡ SPEED OPTIMIZATION SETTINGS")
-    logger.info("="*60)
-    logger.info(f"✓ DataLoader workers: {num_workers}")
-    logger.info(f"✓ Gradient accumulation steps: {accumulation_steps}")
-    logger.info(f"✓ Effective batch size: {batch_size * accumulation_steps}")
-    logger.info(f"✓ BFloat16: {use_bfloat16 and device.type == 'cuda'}")
-    logger.info(f"✓ torch.compile: {use_compile}")
-    logger.info(f"✓ Scheduler type: {scheduler_type}")
-    if scheduler_type == 'linear_warmup':
-        logger.info(f"✓ Warmup steps: {warmup_steps}")
+    logger.info("\n" + "="*60 + "\n⚡ SPEED OPTIMIZATION SETTINGS\n" + "="*60)
+    logger.info(f"✓ DataLoader workers: {config.num_workers}")
+    logger.info(f"✓ Gradient accumulation steps: {config.accumulation_steps}")
+    logger.info(f"✓ Effective batch size: {config.batch_size * config.accumulation_steps}")
+    logger.info(f"✓ BFloat16: {config.use_bfloat16 and str(device) == 'cuda'}")
+    logger.info(f"✓ torch.compile: {config.use_compile}")
+    logger.info(f"✓ Scheduler type: {config.scheduler_type}")
+    if config.scheduler_type == 'linear_warmup': logger.info(f"✓ Warmup steps: {config.warmup_steps}")
     logger.info("="*60 + "\n")
     
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_safetensors=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, use_safetensors=True).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_safetensors=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, use_safetensors=True).to(device)
     model.config.dropout = 0.15
     model.config.attention_dropout = 0.15
     
-    # 🆕 torch.compile (PyTorch 2.0+)
-    # Transformersとの互換性問題を回避するため、エラー抑制を有効化
-    """
-    if use_compile and hasattr(torch, 'compile'):
-        logger.info("🔥 Compiling model with torch.compile...")
+    if config.use_compile and hasattr(torch, 'compile'):
         try:
             import torch._dynamo
-            torch._dynamo.config.suppress_errors = True  # Transformers互換性のため
+            torch._dynamo.config.suppress_errors = True
             model = torch.compile(model, mode='reduce-overhead')
             logger.info("✅ Model compiled successfully!")
         except Exception as e:
-            logger.warning(f"⚠️  torch.compile failed: {e}. Continuing without compilation.")
-            use_compile = False
-    """
-    # データセット構築
+            logger.warning(f"⚠️ torch.compile failed: {e}. Continuing without compilation.")
+            
+    return device, tokenizer, model
+
+def create_dataloaders(config: TrainingConfig, tokenizer):
+    """データセットとデータローダーの構築"""
     dataset = build_combined_dataset(
-        file_paths,
+        config.file_paths,
         tokenizer,
-        max_len=max_len,
-        max_samples_per_span_file=max_samples_per_span_file,
-        random_seed=random_seed,
-        tags=tags
+        max_len=config.max_len,
+        max_samples_per_span_file=config.max_samples_per_span_file,
+        random_seed=config.random_seed,
+        tags=config.tags
     )
-    val_size = int(len(dataset) * val_split)
+
+    # Split dataset into training and validation sets
+    val_size = int(len(dataset) * config.val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(
         dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(random_seed)
+        generator=torch.Generator().manual_seed(config.random_seed)
     )
 
-    # まず ConcatDataset 全体から index を作る
+    # Separate indices for bywork and span datasets within the training set
     bywork_idx, span_idx = split_concat_dataset(dataset)
-
-    # 次に train / val 分割
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(random_seed)
-    )
     train_indices = set(train_dataset.indices)
-
     train_bywork_idx = [i for i in bywork_idx if i in train_indices]
-    train_span_idx = [i for i in span_idx   if i in train_indices]
+    train_span_idx = [i for i in span_idx if i in train_indices]
 
     train_bywork = Subset(dataset, train_bywork_idx)
     train_span = Subset(dataset, train_span_idx)
     
     logger.info(f"\n📊 Dataset split:")
-    logger.info(f"  Training: {train_size:,} samples")
-    logger.info(f"  Validation: {val_size:,} samples\n")
-    
-    # 🆕 DataLoaderの最適化
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,  # マルチプロセス読み込み
-        pin_memory=True,  # GPU転送の高速化
-        prefetch_factor=2,  # 先読みバッファ
-        persistent_workers=True if num_workers > 0 else False  # ワーカープロセスを維持
-    )
+    logger.info(f"  Training: {len(train_dataset):,} samples ({len(train_bywork)} by-work, {len(train_span)} span)")
+    logger.info(f"  Validation: {len(val_dataset):,} samples\n")
 
     span_collator = build_randomspan_collator(tokenizer)
 
-    train_loader_span = DataLoader(
-        train_span,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=span_collator,
-        pin_memory=True,
-        persistent_workers=True
-    )
+    loader_args = {'num_workers': config.num_workers, 'pin_memory': True, 'persistent_workers': config.num_workers > 0}
 
-    train_loader_bywork = DataLoader(
-        train_bywork,
-        batch_size=max(1, batch_size // 4),  # 長文なので小さめ
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True
-    )
+    train_loader_span = DataLoader(train_span, batch_size=config.batch_size, shuffle=True, collate_fn=span_collator, **loader_args)
+    train_loader_bywork = DataLoader(train_bywork, batch_size=max(1, config.batch_size // 4), shuffle=True, **loader_args)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size * 2, shuffle=False, **loader_args)
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size * 2,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True if num_workers > 0 else False
-    )
+    return [train_loader_span, train_loader_bywork], val_loader, dataset
+
+
+def create_optimizer_and_scheduler(model, config: TrainingConfig, train_loaders):
+    """オプティマイザとスケジューラの作成"""
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    
-    # 🆕 スケジューラの選択
-    scheduler = None
-    if scheduler_type == 'onecycle':
-        total_steps = len(train_loader) * epochs // accumulation_steps
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=learning_rate * 10,  # 最大学習率
-            total_steps=total_steps,
-            pct_start=0.3,  # ウォームアップの割合
-            anneal_strategy='cos',
-            div_factor=25.0,  # 初期学習率 = max_lr / div_factor
-            final_div_factor=1e4  # 最終学習率 = max_lr / final_div_factor
-        )
+    total_steps_per_epoch = sum(len(loader) for loader in train_loaders)
+    total_steps = total_steps_per_epoch * config.epochs // config.accumulation_steps
+
+    if config.scheduler_type == 'onecycle':
+        scheduler = OneCycleLR(optimizer, max_lr=config.learning_rate * 10, total_steps=total_steps, pct_start=0.3, anneal_strategy='cos', div_factor=25.0, final_div_factor=1e4)
         logger.info(f"📈 OneCycleLR scheduler initialized (total_steps={total_steps})")
-    elif scheduler_type == 'linear_warmup':
-        num_training_steps = (len(train_loader) // accumulation_steps) * epochs
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        logger.info(f"📈 Linear warmup scheduler initialized (warmup_steps={warmup_steps}, total_steps={num_training_steps})")
+    elif config.scheduler_type == 'linear_warmup':
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=config.warmup_steps, num_training_steps=total_steps)
+        logger.info(f"📈 Linear warmup scheduler initialized (warmup_steps={config.warmup_steps}, total_steps={total_steps})")
+    else:
+        scheduler = None
+        
+    return optimizer, scheduler
+
+def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config: TrainingConfig, epoch: int):
+    """1エポック分の学習処理"""
+    model.train()
+    total_loss = 0
+    use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
+
+    for loader in loaders:
+        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
+        for batch_idx, batch in enumerate(pbar):
+            if batch_idx % config.accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+
+            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
+            
+            loss_divisor = config.accumulation_steps
+            autocast_args = {'dtype': torch.bfloat16} if use_bf16 else {}
+            
+            with autocast(**autocast_args):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss / loss_divisor
+
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (batch_idx + 1) % config.accumulation_steps == 0:
+                if config.gradient_clip > 0:
+                    if scaler: scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                
+                if scheduler: scheduler.step()
+
+            batch_loss = loss.item() * loss_divisor
+            total_loss += batch_loss
+            pbar.set_postfix(loss=f"{batch_loss:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            
+    return total_loss
+
+def train_model(config: TrainingConfig):
+    """最適化された学習関数（リファクタリング版）"""
+    device, tokenizer, model = setup_training(config)
+    train_loaders, val_loader, dataset = create_dataloaders(config, tokenizer)
+    optimizer, scheduler = create_optimizer_and_scheduler(model, config, train_loaders)
     
-    # 🆕 BFloat16サポートチェック
-    use_bf16 = use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
-    if use_bfloat16 and not use_bf16:
-        logger.warning("⚠️  BFloat16 requested but not supported. Falling back to FP16.")
+    use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if config.use_bfloat16 and not use_bf16: logger.warning("⚠️ BFloat16 requested but not supported. Falling back to FP16.")
+    scaler = GradScaler() if config.use_amp and device.type == "cuda" and not use_bf16 else None
     
-    scaler = GradScaler() if use_amp and device.type == "cuda" and not use_bf16 else None
-    early_stopping = EarlyStopping(patience=patience)
-    
+    early_stopping = EarlyStopping(patience=config.patience)
     best_val_loss = float('inf')
-    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(config.save_dir, exist_ok=True)
+    
     freeze_encoder_layers(model, ratio=0.5)
+    logger.info("🔒 Encoder layers partially frozen (ratio=0.5)")
 
-    for epoch in range(epochs):
-        start_prob = 0.5
-        end_prob = 0.1
-        current_prob = start_prob + (end_prob - start_prob) * (epoch / max(1, epochs - 1))
+    for epoch in range(config.epochs):
+        start_prob, end_prob = 0.5, 0.1
+        current_prob = start_prob + (end_prob - start_prob) * (epoch / max(1, config.epochs - 1))
         for ds in dataset.datasets:
-            if isinstance(ds, TranslationDatasetRandomSpan):
-                ds.set_multi_prob(current_prob)
-
+            if isinstance(ds, TranslationDatasetRandomSpan): ds.set_multi_prob(current_prob)
         logger.info(f"📉 RandomSpan multi_prob = {current_prob:.2f}")
 
-        model.train()
-        total_loss = 0
-        loaders = [train_loader_span, train_loader_bywork]
-        for loader in loaders:
-            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
-
-            for batch_idx, batch in enumerate(pbar):
-
-                # accumulation の先頭で zero_grad
-                if batch_idx % accumulation_steps == 0:
-                    optimizer.zero_grad(set_to_none=True)
-
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
-
-                if use_bf16:
-                    with autocast(dtype=torch.bfloat16):
-                        outputs = model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=labels
-                        )
-                        loss = outputs.loss / accumulation_steps
-                    loss.backward()
-
-                elif scaler:
-                    with autocast():
-                        outputs = model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=labels
-                        )
-                        loss = outputs.loss / accumulation_steps
-                    scaler.scale(loss).backward()
-
-                else:
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
-                    loss = outputs.loss / accumulation_steps
-                    loss.backward()
-
-                # ★ ここから「更新フェーズ」
-                if (batch_idx + 1) % accumulation_steps == 0:
-
-                    if gradient_clip > 0:
-                        if scaler:
-                            scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-
-                    if scaler:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-
-                    if scheduler:
-                        scheduler.step()
-
-                # ★ ログ用損失は毎バッチ
-                total_loss += loss.item() * accumulation_steps
-
-                current_lr = optimizer.param_groups[0]["lr"]
-                pbar.set_postfix(
-                    loss=f"{loss.item() * accumulation_steps:.4f}",
-                    lr=f"{current_lr:.2e}"
-                )
-
+        train_loss = train_epoch(model, train_loaders, optimizer, scheduler, scaler, device, config, epoch)
+        
         if epoch == 1:
-            for p in model.parameters():
-                p.requires_grad = True
+            for p in model.parameters(): p.requires_grad = True
             logger.info("🔓 Encoder fully unfrozen")
 
-        # エポック終了時の検証
         val_loss = evaluate_model(model, val_loader, device)
-        logger.info(f"📊 Epoch {epoch+1}/{epochs} - Validation loss: {val_loss:.4f}")
+        total_train_samples = sum(len(l.dataset) for l in train_loaders)
+        avg_train_loss = train_loss / total_train_samples if total_train_samples > 0 else 0
+        logger.info(f"📊 Epoch {epoch+1}/{config.epochs} -> Train loss: {avg_train_loss:.4f}, Validation loss: {val_loss:.4f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            model.save_pretrained(os.path.join(save_dir, "best_model"))
-            tokenizer.save_pretrained(os.path.join(save_dir, "best_model"))
-            logger.info("⭐ New best model saved!")
+            save_path = os.path.join(config.save_dir, "best_model")
+            model.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
+            logger.info(f"⭐ New best model saved to {save_path}!")
         
         early_stopping(val_loss)
         if early_stopping.early_stop:
@@ -692,7 +621,6 @@ def train_model(
     
     logger.info(f"\n✅ Training completed! Best validation loss: {best_val_loss:.4f}")
     return model, tokenizer
-
 
 # ===============================
 # 6. 翻訳関数
@@ -739,46 +667,27 @@ if __name__ == "__main__":
     # tags = [None, None, None, None, "[LYRICS]"]  # 歌詞データにタグを付ける例
     tags = None  # タグなしの場合
    
-    MODEL_NAME = "Helsinki-NLP/opus-mt-en-jap"
-    SAVE_DIR = "./models/translation_model_final"
-    
-    # === OneCycleLR スケジューラを使う場合 ===
-    model, tokenizer = train_model(
-        MODEL_NAME,
-        files,
+    # --- 学習設定 ---
+    config = TrainingConfig(
+        model_name="Helsinki-NLP/opus-mt-en-jap",
+        file_paths=files,
         epochs=2,
         batch_size=16,
         max_samples_per_span_file=40000,
-        save_dir=SAVE_DIR,
+        save_dir="./models/translation_model_final",
         random_seed=42,
         tags=tags,
-        # 高速化パラメータ
+        # --- 高速化設定 ---
         num_workers=4,
         accumulation_steps=4,
         use_bfloat16=True,
-        use_compile=True,
-        scheduler_type='onecycle'  # OneCycleLR使用
+        scheduler_type='onecycle'
     )
     
-    # === Linear Warmup スケジューラを使う場合 ===
-    # model, tokenizer = train_model(
-    #     MODEL_NAME,
-    #     files,
-    #     epochs=2,
-    #     batch_size=16,
-    #     max_samples_per_span_file=40000,
-    #     save_dir=SAVE_DIR,
-    #     random_seed=42,
-    #     tags=tags,
-    #     # 高速化パラメータ
-    #     num_workers=4,
-    #     accumulation_steps=4,
-    #     use_bfloat16=True,
-    #     use_compile=True,
-    #     scheduler_type='linear_warmup',  # Linear Warmup使用
-    #     warmup_steps=500
-    # )
+    # --- 学習実行 ---
+    model, tokenizer = train_model(config)
     
+    # --- 翻訳テスト ---
     test_sentences = [
         "I like apples.",
         "How are you?",
