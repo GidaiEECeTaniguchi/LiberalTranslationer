@@ -1,11 +1,11 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, get_linear_schedule_with_warmup, DataCollatorForSeq2Seq
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 import random
-
+from torch.utils.data import Dataset,Subset
 import os
 from pathlib import Path
 import json
@@ -160,7 +160,32 @@ def load_datasets_balanced(file_paths, max_samples_per_type=None, random_seed=42
 # ===============================
 # 2. メモリ効率的な Dataset クラス
 # ===============================
-from torch.utils.data import Dataset
+
+
+# RandomSpan 用 collator（dynamic padding + label smoothing）
+def build_randomspan_collator(tokenizer, label_smoothing=0.1):
+    return DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=None,                     # loss は model 側で
+        padding="longest",
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8            # TensorCore 効率
+    )
+def split_concat_dataset(dataset):
+    bywork_indices = []
+    span_indices = []
+
+    for i, ds in enumerate(dataset.datasets):
+        if isinstance(ds, TranslationDatasetByWorkMemoryEfficient):
+            bywork_indices.extend(range(dataset.cumulative_sizes[i-1] if i > 0 else 0,
+                                         dataset.cumulative_sizes[i]))
+        else:
+            span_indices.extend(range(dataset.cumulative_sizes[i-1] if i > 0 else 0,
+                                       dataset.cumulative_sizes[i]))
+
+    return bywork_indices, span_indices
+
+
 
 class TranslationDatasetRandomSpan(Dataset):
     """ランダムスパンデータセット"""
@@ -209,6 +234,10 @@ class TranslationDatasetRandomSpan(Dataset):
             "attention_mask": src_tok["attention_mask"].squeeze(),
             "labels": labels.squeeze(),
         }
+
+    def set_multi_prob(self, value: float):
+        self.multi_prob = max(0.0, min(1.0, value))
+
 
 
 class TranslationDatasetByWorkMemoryEfficient(torch.utils.data.Dataset):
@@ -358,6 +387,14 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
+
+
+def freeze_encoder_layers(model, ratio=0.5):
+    enc_layers = model.model.encoder.layers
+    freeze_until = int(len(enc_layers) * ratio)
+    for i, layer in enumerate(enc_layers):
+        for p in layer.parameters():
+            p.requires_grad = i >= freeze_until
 # ===============================
 # 5. 高速化された学習関数
 # ===============================
@@ -411,16 +448,23 @@ def train_model(
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_safetensors=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, use_safetensors=True).to(device)
+    model.config.dropout = 0.15
+    model.config.attention_dropout = 0.15
     
     # 🆕 torch.compile (PyTorch 2.0+)
+    # Transformersとの互換性問題を回避するため、エラー抑制を有効化
+    """
     if use_compile and hasattr(torch, 'compile'):
         logger.info("🔥 Compiling model with torch.compile...")
         try:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True  # Transformers互換性のため
             model = torch.compile(model, mode='reduce-overhead')
             logger.info("✅ Model compiled successfully!")
         except Exception as e:
             logger.warning(f"⚠️  torch.compile failed: {e}. Continuing without compilation.")
-    
+            use_compile = False
+    """
     # データセット構築
     dataset = build_combined_dataset(
         file_paths, 
@@ -430,13 +474,18 @@ def train_model(
         random_seed=random_seed,
         tags=tags
     )
-    
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(
-        dataset, [train_size, val_size], 
+        dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(random_seed)
     )
+
+    bywork_idx, span_idx = split_concat_dataset(train_dataset)
+
+    train_bywork = Subset(train_dataset, bywork_idx)
+    train_span   = Subset(train_dataset, span_idx)
+
     
     logger.info(f"\n📊 Dataset split:")
     logger.info(f"  Training: {train_size:,} samples")
@@ -452,6 +501,28 @@ def train_model(
         prefetch_factor=2,              # 先読みバッファ
         persistent_workers=True if num_workers > 0 else False  # ワーカープロセスを維持
     )
+
+    span_collator = build_randomspan_collator(tokenizer)
+
+    train_loader_span = DataLoader(
+        train_span,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=span_collator,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    train_loader_bywork = DataLoader(
+        train_bywork,
+        batch_size=max(1, batch_size // 4),  # 長文なので小さめ
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
     
     val_loader = DataLoader(
         val_dataset, 
@@ -498,66 +569,82 @@ def train_model(
     
     best_val_loss = float('inf')
     os.makedirs(save_dir, exist_ok=True)
-    
+    freeze_encoder_layers(model, ratio=0.5)
+
     for epoch in range(epochs):
+        start_prob = 0.5
+        end_prob = 0.1
+        current_prob = start_prob + (end_prob - start_prob) * (epoch / max(1, epochs - 1))
+        for ds in dataset.datasets:
+            if isinstance(ds, TranslationDatasetRandomSpan):
+                ds.set_multi_prob(current_prob)
+
+        logger.info(f"📉 RandomSpan multi_prob = {current_prob:.2f}")
+
         model.train()
         total_loss = 0
-        optimizer.zero_grad()  # 最初にゼロ化
+        loaders = [train_loader_span, train_loader_bywork]
+        for loader in loaders:
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        
-        for batch_idx, batch in enumerate(pbar):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            for batch_idx, batch in enumerate(pbar):
+                # 最初のバッチまたはaccumulationの最初で勾配をゼロ化
+                if batch_idx % accumulation_steps == 0:
+                    optimizer.zero_grad()
             
-            # 🆕 BFloat16対応の混合精度学習
-            if use_bf16:
-                # BFloat16を使用
-                with autocast(dtype=torch.bfloat16):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs.loss / accumulation_steps  # 🆕 Gradient Accumulation用にスケーリング
-                loss.backward()
-            elif scaler:
-                # FP16を使用
-                with autocast():
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+            
+                # 🆕 BFloat16対応の混合精度学習
+                if use_bf16:
+                    # BFloat16を使用
+                    with autocast(dtype=torch.bfloat16):
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = outputs.loss / accumulation_steps  # 🆕 Gradient Accumulation用にスケーリング
+                    loss.backward()
+                elif scaler:
+                    # FP16を使用
+                    with autocast():
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = outputs.loss / accumulation_steps
+                    scaler.scale(loss).backward()
+                else:
+                    # FP32を使用
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                     loss = outputs.loss / accumulation_steps
-                scaler.scale(loss).backward()
-            else:
-                # FP32を使用
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / accumulation_steps
-                loss.backward()
+                    loss.backward()
             
             # 🆕 Gradient Accumulation: 指定ステップごとにパラメータ更新
-            if (batch_idx + 1) % accumulation_steps == 0:
-                if gradient_clip > 0:
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    if gradient_clip > 0:
+                        if scaler:
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                
                     if scaler:
-                        scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
                 
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                
-                optimizer.zero_grad()
-                
-                # 🆕 スケジューラのステップ
-                if scheduler:
-                    scheduler.step()
+                # 🆕 スケジューラのステップ (optimizer.step()の後に呼ぶ)
+                    if scheduler:
+                        scheduler.step()
             
-            total_loss += loss.item() * accumulation_steps  # 元のスケールに戻す
+                total_loss += loss.item() * accumulation_steps  # 元のスケールに戻す
             
             # 現在の学習率を表示
-            current_lr = optimizer.param_groups[0]['lr']
-            pbar.set_postfix({
-                "loss": f"{loss.item() * accumulation_steps:.4f}",
-                "lr": f"{current_lr:.2e}"
-            })
-        
+                current_lr = optimizer.param_groups[0]['lr']
+                pbar.set_postfix({
+                    "loss": f"{loss.item() * accumulation_steps:.4f}",
+                    "lr": f"{current_lr:.2e}"
+                })
+        if epoch == 1:
+            for p in model.parameters():
+                p.requires_grad = True
+            logger.info("🔓 Encoder fully unfrozen")
+
         # エポック終了時の検証
         val_loss = evaluate_model(model, val_loader, device)
         logger.info(f"📊 Epoch {epoch+1}/{epochs} - Validation loss: {val_loss:.4f}")
@@ -572,9 +659,12 @@ def train_model(
         if early_stopping.early_stop:
             logger.info(f"🛑 Early stopping triggered at epoch {epoch+1}")
             break
+
     
     logger.info(f"\n✅ Training completed! Best validation loss: {best_val_loss:.4f}")
     return model, tokenizer
+
+
 
 # ===============================
 # 6. 翻訳関数
