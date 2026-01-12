@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, get_linear_schedule_with_warmup, DataCollatorForSeq2Seq
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, random_split
@@ -12,6 +14,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
+import copy
+import matplotlib.pyplot as plt
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +23,245 @@ logger = logging.getLogger(__name__)
 
 
 # ===============================
-# 0. 設定クラス
+# 🆕 新機能1: Focal Loss
+# ===============================
+class FocalLoss(nn.Module):
+    """
+    難しいサンプルにより注目するFocal Loss
+    
+    Args:
+        alpha: クラスバランス調整パラメータ
+        gamma: 焦点パラメータ（大きいほど難しいサンプルに注目）
+        reduction: 損失の集約方法
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, logits, targets, ignore_index=-100):
+        """
+        Args:
+            logits: (batch_size, seq_len, vocab_size)
+            targets: (batch_size, seq_len)
+        """
+        # logitsを2次元に変形
+        logits_flat = logits.view(-1, logits.size(-1))
+        targets_flat = targets.view(-1)
+        
+        # ignore_indexをマスク
+        mask = targets_flat != ignore_index
+        valid_logits = logits_flat[mask]
+        valid_targets = targets_flat[mask]
+        
+        if valid_logits.size(0) == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        # クロスエントロピー損失
+        ce_loss = F.cross_entropy(valid_logits, valid_targets, reduction='none')
+        
+        # p_t: 正解クラスの予測確率
+        p_t = torch.exp(-ce_loss)
+        
+        # Focal Loss
+        focal_loss = self.alpha * (1 - p_t) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+# ===============================
+# 🆕 新機能2: EMA (Exponential Moving Average)
+# ===============================
+class EMA:
+    """
+    モデルパラメータの指数移動平均を保持
+    学習の安定化と汎化性能向上に寄与
+    
+    Args:
+        model: 対象モデル
+        decay: 減衰率（0.999-0.9999が一般的）
+    """
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+    def register(self):
+        """EMAの初期化"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+        logger.info(f"✅ EMA registered with decay={self.decay}")
+    
+    def update(self):
+        """パラメータの移動平均を更新"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        """EMAパラメータをモデルに適用（評価時用）"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        """元のパラメータを復元（学習再開時用）"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+# ===============================
+# 🆕 新機能3: 学習率ファインダー
+# ===============================
+class LRFinder:
+    """
+    最適な学習率を自動探索
+    
+    使い方:
+        lr_finder = LRFinder(model, optimizer, criterion, device)
+        suggested_lr = lr_finder.find(train_loader, min_lr=1e-7, max_lr=1)
+    """
+    def __init__(self, model, optimizer, criterion, device):
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.device = device
+        self.history = {'lr': [], 'loss': []}
+        
+    def find(self, train_loader, min_lr=1e-7, max_lr=1, num_iter=100, smooth_f=0.05):
+        """
+        学習率を徐々に上げながら損失を記録
+        
+        Args:
+            train_loader: 学習データローダー
+            min_lr: 最小学習率
+            max_lr: 最大学習率
+            num_iter: イテレーション数
+            smooth_f: 損失の平滑化係数
+        
+        Returns:
+            推奨学習率
+        """
+        logger.info(f"🔍 LR Finder: Searching optimal learning rate ({min_lr} to {max_lr})...")
+        
+        # モデルとオプティマイザの状態を保存
+        model_state = copy.deepcopy(self.model.state_dict())
+        optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+        
+        # 学習率スケジューラを設定（指数的に増加）
+        mult = (max_lr / min_lr) ** (1 / num_iter)
+        lr = min_lr
+        self.optimizer.param_groups[0]['lr'] = lr
+        
+        avg_loss = 0.0
+        best_loss = float('inf')
+        batch_num = 0
+        losses = []
+        
+        iterator = iter(train_loader)
+        
+        pbar = tqdm(range(num_iter), desc="LR Finder")
+        for iteration in pbar:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                batch = next(iterator)
+            
+            batch_num += 1
+            
+            # 順伝播
+            self.optimizer.zero_grad()
+            
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            
+            loss = outputs.loss
+            
+            # 移動平均で損失を平滑化
+            if iteration == 0:
+                avg_loss = loss.item()
+            else:
+                avg_loss = smooth_f * loss.item() + (1 - smooth_f) * avg_loss
+            
+            # 最良損失を更新
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+            
+            # 記録
+            self.history['lr'].append(lr)
+            self.history['loss'].append(avg_loss)
+            
+            # 損失が発散したら停止
+            if batch_num > 1 and avg_loss > 4 * best_loss:
+                logger.info(f"⚠️ Loss diverged, stopping LR finder")
+                break
+            
+            # 逆伝播
+            loss.backward()
+            self.optimizer.step()
+            
+            # 学習率を更新
+            lr *= mult
+            self.optimizer.param_groups[0]['lr'] = lr
+            
+            pbar.set_postfix(lr=f"{lr:.2e}", loss=f"{avg_loss:.4f}")
+        
+        # モデルとオプティマイザを復元
+        self.model.load_state_dict(model_state)
+        self.optimizer.load_state_dict(optimizer_state)
+        
+        # 最適な学習率を提案（最小損失の1/10の位置）
+        min_loss_idx = self.history['loss'].index(min(self.history['loss']))
+        suggested_lr = self.history['lr'][max(0, min_loss_idx - len(self.history['lr']) // 10)]
+        
+        logger.info(f"✅ Suggested learning rate: {suggested_lr:.2e}")
+        
+        return suggested_lr
+    
+    def plot(self, save_path="lr_finder_plot.png"):
+        """学習率vs損失のグラフを保存"""
+        # ディレクトリが存在しない場合は作成
+        save_dir = os.path.dirname(save_path)
+        if save_dir and not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.history['lr'], self.history['loss'])
+        plt.xscale('log')
+        plt.xlabel('Learning Rate (log scale)')
+        plt.ylabel('Loss')
+        plt.title('Learning Rate Finder')
+        plt.grid(True)
+        plt.savefig(save_path)
+        plt.close()  # メモリリーク防止
+        logger.info(f"📊 LR Finder plot saved to {save_path}")
+
+
+# ===============================
+# 0. 設定クラス（拡張版）
 # ===============================
 @dataclass
 class TrainingConfig:
@@ -44,29 +286,35 @@ class TrainingConfig:
     scheduler_type: str = 'onecycle'
     warmup_steps: int = 500
     
-    # 🆕 モックモード設定
+    # 🆕 新機能のパラメータ
+    use_focal_loss: bool = True
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
+    
+    use_label_smoothing: bool = True
+    label_smoothing: float = 0.1
+    
+    use_ema: bool = True
+    ema_decay: float = 0.9999
+    
+    use_lr_finder: bool = True
+    lr_finder_min: float = 1e-7
+    lr_finder_max: float = 1e-2
+    lr_finder_num_iter: int = 100
+    
+    # モックモード設定
     mock_mode: bool = False
-    mock_samples: int = 100  # モック時のサンプル数
-    mock_force_cpu: bool = True  # モック時は強制的にCPU使用
+    mock_samples: int = 100
+    mock_force_cpu: bool = True
 
 
 # ===============================
-# 🆕 モックデータ生成
+# 1. モックデータ生成（元のコードから）
 # ===============================
 def generate_mock_data(num_samples=100, seed=42):
-    """
-    テスト用のモックデータを生成
-    
-    Args:
-        num_samples: 生成するサンプル数
-        seed: ランダムシード
-    
-    Returns:
-        en_list, ja_list
-    """
+    """テスト用のモックデータを生成"""
     random.seed(seed)
     
-    # シンプルな英日対訳のテンプレート
     templates = [
         ("I like {}", "私は{}が好きです"),
         ("This is a {}", "これは{}です"),
@@ -94,259 +342,49 @@ def generate_mock_data(num_samples=100, seed=42):
     return en_list, ja_list
 
 
-def create_mock_jsonl_files(output_dir="./mock_data", num_files=2, samples_per_file=50):
-    """
-    モック用のJSONLファイルを生成
-    
-    Args:
-        output_dir: 出力ディレクトリ
-        num_files: 生成するファイル数
-        samples_per_file: ファイルごとのサンプル数
-    
-    Returns:
-        生成されたファイルパスのリスト
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    file_paths = []
-    
-    for i in range(num_files):
-        file_path = os.path.join(output_dir, f"mock_data_{i+1}.jsonl")
-        en_list, ja_list = generate_mock_data(samples_per_file, seed=42 + i)
-        
-        with open(file_path, "w", encoding="utf-8") as f:
-            for en, ja in zip(en_list, ja_list):
-                json.dump({"en": en, "ja": ja}, f, ensure_ascii=False)
-                f.write("\n")
-        
-        file_paths.append(file_path)
-        logger.info(f"✅ Created mock file: {file_path}")
-    
-    return file_paths
-
-
 # ===============================
-# 1. メモリ効率的なデータ読み込み
+# 2. データセットクラス（元のコードから簡略版）
 # ===============================
-def add_tag_if_needed(text, tag):
-    """タグを追加するヘルパー関数"""
-    return f"{tag} {text}" if tag else text
-
-
-def load_single_dataset_streaming(file_path, max_samples=None, random_seed=42, tag=None):
-    """
-    メモリ効率的にJSONLファイルを読み込み
-    全行を一度にメモリに読み込まず、必要な分だけ処理
-    
-    Args:
-        file_path: 読み込むファイルパス
-        max_samples: 最大サンプル数
-        random_seed: ランダムシード
-        tag: 英文の先頭に追加するタグ (例: "[LYRICS]")
-    """
-    en_list, ja_list = [], []
-    error_count = 0
-    
-    logger.info(f"📖 Loading {file_path} ...")
-    
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            # max_samplesが指定されている場合
-            if max_samples:
-                # まず全行数をカウント(メモリ効率的に)
-                total_lines = sum(1 for _ in f)
-                f.seek(0)  # ファイルポインタを先頭に戻す
-                
-                if total_lines > max_samples:
-                    logger.info(f"  ⚡ Sampling {max_samples} from {total_lines} lines")
-                    # サンプリングする行番号を事前に決定
-                    random.seed(random_seed)
-                    selected_indices = set(random.sample(range(total_lines), max_samples))
-                    
-                    # 選択された行だけを処理
-                    for idx, line in enumerate(tqdm(f, total=total_lines,
-                                                    desc=f"Reading {os.path.basename(file_path)}",
-                                                    unit=" lines")):
-                        if idx in selected_indices:
-                            try:
-                                data = json.loads(line)
-                                en, ja = data.get("en"), data.get("ja")
-                                if en and ja and len(en.strip()) > 0 and len(ja.strip()) > 0:
-                                    en_list.append(add_tag_if_needed(en, tag))
-                                    ja_list.append(ja)
-                            except json.JSONDecodeError:
-                                error_count += 1
-                else:
-                    # 全行を処理
-                    f.seek(0)
-                    for line in tqdm(f, total=total_lines,
-                                   desc=f"Reading {os.path.basename(file_path)}",
-                                   unit=" lines"):
-                        try:
-                            data = json.loads(line)
-                            en, ja = data.get("en"), data.get("ja")
-                            if en and ja and len(en.strip()) > 0 and len(ja.strip()) > 0:
-                                en_list.append(add_tag_if_needed(en, tag))
-                                ja_list.append(ja)
-                        except json.JSONDecodeError:
-                            error_count += 1
-            else:
-                # max_samplesなしの場合は全行を処理
-                for line in tqdm(f, desc=f"Reading {os.path.basename(file_path)}", unit=" lines"):
-                    try:
-                        data = json.loads(line)
-                        en, ja = data.get("en"), data.get("ja")
-                        if en and ja and len(en.strip()) > 0 and len(ja.strip()) > 0:
-                            en_list.append(add_tag_if_needed(en, tag))
-                            ja_list.append(ja)
-                    except json.JSONDecodeError:
-                        error_count += 1
-    
-    except FileNotFoundError:
-        logger.error(f"❌ File not found: {file_path}")
-        return [], []
-    except Exception as e:
-        logger.error(f"❌ Unexpected error loading {file_path}: {e}")
-        return [], []
-    
-    if error_count > 0:
-        logger.warning(f"  ⚠️  Skipped {error_count} invalid lines")
-    
-    logger.info(f"  ✅ Loaded {len(en_list)} pairs from {os.path.basename(file_path)}")
-    return en_list, ja_list
-
-
-def load_datasets_balanced(file_paths, max_samples_per_type=None, random_seed=42, tags=None):
-    """
-    ByWork系とRandomSpan系を分けて、それぞれから適切にサンプリング
-    
-    Args:
-        file_paths: ファイルパスのリスト
-        max_samples_per_type: RandomSpan系の各ファイルから取得する最大サンプル数
-        random_seed: ランダムシード
-        tags: 各ファイルに対応するタグのリスト (Noneの場合はタグなし)
-    
-    Returns:
-        bywork_files: [(file_path, en_list, ja_list), ...]
-        span_files: [(file_path, en_list, ja_list), ...]
-    """
-    bywork_files = []
-    span_files = []
-    
-    # tagsがNoneの場合は全てNoneのリストを作成
-    if tags is None:
-        tags = [None] * len(file_paths)
-    
-    for fp, tag in zip(file_paths, tags):
-        is_bywork = "separated" in Path(fp).name or "sepalated" in Path(fp).name
-        
-        if is_bywork:
-            # ByWork系は全て読み込む
-            logger.info(f"\n🎯 [WORK-LEVEL] {fp} (loading ALL)")
-            en_list, ja_list = load_single_dataset_streaming(fp, max_samples=None, random_seed=random_seed, tag=tag)
-            bywork_files.append((fp, en_list, ja_list))
-        else:
-            # RandomSpan系はmax_samples_per_type分だけ
-            logger.info(f"\n🎲 [SPAN-LEVEL] {fp}")
-            en_list, ja_list = load_single_dataset_streaming(fp, max_samples=max_samples_per_type, random_seed=random_seed, tag=tag)
-            span_files.append((fp, en_list, ja_list))
-    
-    # サマリー表示
-    logger.info("\n" + "="*60)
-    logger.info("📊 LOADING SUMMARY")
-    logger.info("="*60)
-    
-    total_bywork = sum(len(data[1]) for data in bywork_files)
-    logger.info(f"ByWork datasets: {len(bywork_files)} files, {total_bywork:,} pairs total")
-    for fp, en_list, _ in bywork_files:
-        logger.info(f"  - {os.path.basename(fp)}: {len(en_list):,} pairs")
-    
-    total_span = sum(len(data[1]) for data in span_files)
-    logger.info(f"\nRandomSpan datasets: {len(span_files)} files, {total_span:,} pairs total")
-    for fp, en_list, _ in span_files:
-        logger.info(f"  - {os.path.basename(fp)}: {len(en_list):,} pairs")
-    
-    logger.info(f"\n🎉 GRAND TOTAL: {total_bywork + total_span:,} pairs")
-    logger.info("="*60 + "\n")
-    
-    return bywork_files, span_files
-
-
-# ===============================
-# 2. メモリ効率的な Dataset クラス
-# ===============================
-
-# RandomSpan 用 collator(dynamic padding + label smoothing)
-def build_randomspan_collator(tokenizer, label_smoothing=0.1):
-    return DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=None,
-        label_pad_token_id=-100,
-        padding=True,
-    )
-
-
-class TranslationDatasetRandomSpan(Dataset):
-    """RandomSpan系データ用Dataset"""
-    def __init__(self, en_texts, ja_texts, tokenizer, max_len=64, multi_prob=0.5):
-        self.en_texts = en_texts
-        self.ja_texts = ja_texts
+class TranslationDataset(Dataset):
+    def __init__(self, en_list, ja_list, tokenizer, max_len=64):
+        self.en_list = en_list
+        self.ja_list = ja_list
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.multi_prob = multi_prob
-
+        
     def __len__(self):
-        return len(self.en_texts)
-
-    def set_multi_prob(self, prob):
-        self.multi_prob = prob
-
+        return len(self.en_list)
+    
     def __getitem__(self, idx):
-        en_text = self.en_texts[idx]
-        ja_text = self.ja_texts[idx]
+        en_text = self.en_list[idx]
+        ja_text = self.ja_list[idx]
         
         if hasattr(self.tokenizer, 'supported_language_codes'):
             en_text = ">>jap<< " + en_text
-
-        # マルチセンテンス化
-        if random.random() < self.multi_prob and idx + 1 < len(self.en_texts):
-            en_text = en_text + " " + self.en_texts[idx + 1]
-            ja_text = ja_text + " " + self.ja_texts[idx + 1]
-
-        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding=False)
-        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding=False)
-
-        return {
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs["attention_mask"],
-            "labels": labels["input_ids"]
-        }
-
-
-class TranslationDatasetByWork(Dataset):
-    """ByWork系データ用Dataset (シンプル版)"""
-    def __init__(self, en_texts, ja_texts, tokenizer, max_len=64):
-        self.en_texts = en_texts
-        self.ja_texts = ja_texts
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-    def __len__(self):
-        return len(self.en_texts)
-
-    def __getitem__(self, idx):
-        en_text = self.en_texts[idx]
-        ja_text = self.ja_texts[idx]
         
-        if hasattr(self.tokenizer, 'supported_language_codes'):
-            en_text = ">>jap<< " + en_text
-
-        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding="max_length")
-        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding="max_length")
-
+        inputs = self.tokenizer(
+            en_text,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        targets = self.tokenizer(
+            ja_text,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        labels = targets['input_ids'].squeeze()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+        
         return {
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs["attention_mask"],
-            "labels": labels["input_ids"]
+            'input_ids': inputs['input_ids'].squeeze(),
+            'attention_mask': inputs['attention_mask'].squeeze(),
+            'labels': labels
         }
 
 
@@ -354,329 +392,392 @@ class TranslationDatasetByWork(Dataset):
 # 3. Early Stopping
 # ===============================
 class EarlyStopping:
-    def __init__(self, patience=2):
+    def __init__(self, patience=2, min_delta=0.0):
         self.patience = patience
+        self.min_delta = min_delta
         self.counter = 0
-        self.best_loss = float('inf')
+        self.best_loss = None
         self.early_stop = False
-
+        
     def __call__(self, val_loss):
-        if val_loss < self.best_loss:
+        if self.best_loss is None:
             self.best_loss = val_loss
-            self.counter = 0
-        else:
+        elif val_loss > self.best_loss - self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
 
 
 # ===============================
-# 4. 学習補助関数
-# ===============================
-def freeze_encoder_layers(model, ratio=0.5):
-    """Encoderの一部レイヤーを凍結"""
-    if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
-        encoder = model.model.encoder
-    elif hasattr(model, 'encoder'):
-        encoder = model.encoder
-    else:
-        logger.warning("⚠️ Could not find encoder to freeze")
-        return
-
-    if hasattr(encoder, 'layers'):
-        total_layers = len(encoder.layers)
-        freeze_count = int(total_layers * ratio)
-        for i, layer in enumerate(encoder.layers):
-            if i < freeze_count:
-                for param in layer.parameters():
-                    param.requires_grad = False
-        logger.info(f"🔒 Frozen {freeze_count}/{total_layers} encoder layers")
-
-
-def evaluate_model(model, val_loader, device):
-    """検証ループ"""
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            total_loss += outputs.loss.item()
-    
-    return total_loss / len(val_loader)
-
-
-# ===============================
-# 5. 学習メイン処理
+# 4. セットアップ関数（拡張版）
 # ===============================
 def setup_training(config: TrainingConfig):
-    """デバイス、モデル、トークナイザーの初期化"""
-    # 🆕 モックモード時の処理
-    if config.mock_mode:
-        logger.info("🎭 " + "="*60)
-        logger.info("🎭 MOCK MODE ENABLED - Running with synthetic data")
-        logger.info("🎭 " + "="*60)
-        
-        if config.mock_force_cpu:
-            device = torch.device("cpu")
-            logger.info("🎭 Forcing CPU for mock mode")
-        else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """学習環境のセットアップ"""
+    torch.manual_seed(config.random_seed)
+    random.seed(config.random_seed)
+    
+    # デバイス設定
+    if config.mock_mode and config.mock_force_cpu:
+        device = torch.device("cpu")
+        logger.info("🖥️  Using CPU (Mock Mode)")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"🖥️  Using device: {device}")
     
-    logger.info(f"🔧 Device: {device}")
-    
-    # モデルとトークナイザーの読み込み
+    # モデルとトークナイザの読み込み
+    logger.info(f"📦 Loading model: {config.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name).to(device)
+    model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name)
     
-    # torch.compile (オプション)
-    if config.use_compile and hasattr(torch, 'compile'):
-        try:
-            model = torch.compile(model)
-            logger.info("⚡ Model compiled with torch.compile")
-        except Exception as e:
-            logger.warning(f"⚠️ torch.compile failed: {e}")
+    # 🆕 Label Smoothingの設定
+    if config.use_label_smoothing:
+        if hasattr(model.config, 'label_smoothing'):
+            model.config.label_smoothing = config.label_smoothing
+            logger.info(f"✅ Label Smoothing enabled: {config.label_smoothing}")
+    
+    model = model.to(device)
     
     return device, tokenizer, model
 
 
 def create_dataloaders(config: TrainingConfig, tokenizer):
     """データローダーの作成"""
-    # 🆕 モックモード時はモックデータを使用
     if config.mock_mode:
-        logger.info(f"🎭 Generating {config.mock_samples} mock samples...")
-        en_list, ja_list = generate_mock_data(config.mock_samples, seed=config.random_seed)
-        
-        # モックデータをRandomSpan形式として扱う
-        span_files = [("mock_data", en_list, ja_list)]
-        bywork_files = []
+        en_list, ja_list = generate_mock_data(config.mock_samples, config.random_seed)
     else:
-        # 通常のデータ読み込み
-        bywork_files, span_files = load_datasets_balanced(
-            config.file_paths,
-            max_samples_per_type=config.max_samples_per_span_file,
-            random_seed=config.random_seed,
-            tags=config.tags
-        )
+        # 実際のデータ読み込み（簡略化）
+        en_list, ja_list = [], []
+        for file_path in config.file_paths:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        data = json.loads(line)
+                        if 'en' in data and 'ja' in data:
+                            en_list.append(data['en'])
+                            ja_list.append(data['ja'])
+            except FileNotFoundError:
+                logger.warning(f"⚠️ File not found: {file_path}")
     
     # データセット作成
-    all_datasets = []
-    
-    # RandomSpan系
-    for _, en_list, ja_list in span_files:
-        ds = TranslationDatasetRandomSpan(en_list, ja_list, tokenizer, max_len=config.max_len)
-        all_datasets.append(ds)
-    
-    # ByWork系
-    for _, en_list, ja_list in bywork_files:
-        ds = TranslationDatasetByWork(en_list, ja_list, tokenizer, max_len=config.max_len)
-        all_datasets.append(ds)
-    
-    if not all_datasets:
-        raise ValueError("❌ No data loaded! Check file paths.")
-    
-    # データセットの結合
-    from torch.utils.data import ConcatDataset
-    dataset = ConcatDataset(all_datasets)
+    full_dataset = TranslationDataset(en_list, ja_list, tokenizer, config.max_len)
     
     # Train/Val分割
-    val_size = int(len(dataset) * config.val_split)
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    val_size = int(len(full_dataset) * config.val_split)
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(
+        full_dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.random_seed)
+    )
     
-    logger.info(f"📊 Train: {train_size:,} samples, Validation: {val_size:,} samples")
+    # DataLoader作成
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers if not config.mock_mode else 0,
+        pin_memory=True if not config.mock_mode else False
+    )
     
-    # RandomSpanとByWorkを分離
-    span_indices = []
-    bywork_indices = []
-    offset = 0
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers if not config.mock_mode else 0,
+        pin_memory=True if not config.mock_mode else False
+    )
     
-    for i, ds in enumerate(all_datasets):
-        ds_len = len(ds)
-        if isinstance(ds, TranslationDatasetRandomSpan):
-            span_indices.extend(range(offset, offset + ds_len))
-        else:
-            bywork_indices.extend(range(offset, offset + ds_len))
-        offset += ds_len
+    logger.info(f"📊 Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
-    train_span_indices = [i for i in train_dataset.indices if i in span_indices]
-    train_bywork_indices = [i for i in train_dataset.indices if i in bywork_indices]
-    
-    train_span = Subset(dataset, train_span_indices)
-    train_bywork = Subset(dataset, train_bywork_indices)
-    
-    # Collator
-    span_collator = build_randomspan_collator(tokenizer, label_smoothing=0.1)
-    
-    # DataLoader設定
-    loader_args = {
-        'num_workers': 0 if config.mock_mode else config.num_workers,  # 🆕 モック時はnum_workers=0
-        'pin_memory': False if config.mock_mode else True,  # 🆕 モック時はpin_memory無効
-        'persistent_workers': False
-    }
-    
-    # 🆕 バッチサイズの安全性チェック
-    actual_batch_size = config.batch_size
-    bywork_batch_size = max(1, config.batch_size // 4)
-    
-    if config.accumulation_steps > len(train_span) // actual_batch_size:
-        logger.warning(f"⚠️ accumulation_steps ({config.accumulation_steps}) is large relative to dataset size")
-    
-    train_loader_span = DataLoader(train_span, batch_size=actual_batch_size, shuffle=True, collate_fn=span_collator, **loader_args)
-    
-    # 🆕 ByWorkデータが存在する場合のみローダーを作成
-    train_loaders = [train_loader_span]
-    if len(train_bywork) > 0:
-        train_loader_bywork = DataLoader(train_bywork, batch_size=bywork_batch_size, shuffle=True, **loader_args)
-        train_loaders.append(train_loader_bywork)
-    else:
-        logger.info("ℹ️ No ByWork data - using RandomSpan only")
-    
-    # 🆕 val_loaderにもcollatorを適用
-    val_loader = DataLoader(val_dataset, batch_size=actual_batch_size * 2, shuffle=False, collate_fn=span_collator, **loader_args)
-    
-    return train_loaders, val_loader, dataset
+    return train_loader, val_loader
 
 
-def create_optimizer_and_scheduler(model, config: TrainingConfig, train_loaders):
+def create_optimizer_and_scheduler(model, config: TrainingConfig, train_loader):
     """オプティマイザとスケジューラの作成"""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=0.01
+    )
     
-    total_steps_per_epoch = sum(len(loader) for loader in train_loaders)
-    total_steps = total_steps_per_epoch * config.epochs // config.accumulation_steps
-
+    total_steps = len(train_loader) * config.epochs // config.accumulation_steps
+    
     if config.scheduler_type == 'onecycle':
         scheduler = OneCycleLR(
-            optimizer, 
-            max_lr=config.learning_rate * 10, 
-            total_steps=total_steps, 
-            pct_start=0.3, 
-            anneal_strategy='cos', 
-            div_factor=25.0, 
-            final_div_factor=1e4
+            optimizer,
+            max_lr=config.learning_rate,
+            total_steps=total_steps,
+            pct_start=0.1
         )
-        logger.info(f"📈 OneCycleLR scheduler initialized (total_steps={total_steps})")
-    elif config.scheduler_type == 'linear_warmup':
+    else:
         scheduler = get_linear_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=config.warmup_steps, 
+            optimizer,
+            num_warmup_steps=config.warmup_steps,
             num_training_steps=total_steps
         )
-        logger.info(f"📈 Linear warmup scheduler initialized (warmup_steps={config.warmup_steps}, total_steps={total_steps})")
-    else:
-        scheduler = None
-        
+    
     return optimizer, scheduler
 
 
-def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config: TrainingConfig, epoch: int):
-    """1エポック分の学習処理"""
+# ===============================
+# 5. 学習・評価関数（拡張版）
+# ===============================
+def evaluate_model(model, val_loader, device, criterion=None, use_ema=False, ema=None):
+    """
+    モデルの評価
+    
+    Args:
+        model: 評価対象モデル
+        val_loader: 検証データローダー
+        device: デバイス
+        criterion: 損失関数（Noneの場合はモデルデフォルト）
+        use_ema: EMAモデルを使用するか
+        ema: EMAオブジェクト
+    """
+    model.eval()
+    
+    # 🆕 EMAパラメータを適用
+    if use_ema and ema is not None:
+        ema.apply_shadow()
+    
+    total_loss = 0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            
+            if criterion is not None:
+                # Focal Lossを使用
+                loss = criterion(outputs.logits, labels)
+            else:
+                loss = outputs.loss
+            
+            total_loss += loss.item()
+            num_batches += 1
+    
+    # 🆕 EMAパラメータを元に戻す
+    if use_ema and ema is not None:
+        ema.restore()
+    
+    model.train()
+    return total_loss / num_batches if num_batches > 0 else 0
+
+
+def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, config, epoch, criterion=None, ema=None):
+    """
+    1エポックの学習
+    
+    Args:
+        criterion: 損失関数（Focal Loss等）
+        ema: EMAオブジェクト
+    """
     model.train()
     total_loss = 0
+    optimizer.zero_grad()
+    
     use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
-
-    for loader in loaders:
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
-        for batch_idx, batch in enumerate(pbar):
-            if batch_idx % config.accumulation_steps == 0:
-                optimizer.zero_grad(set_to_none=True)
-
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            
-            loss_divisor = config.accumulation_steps
-            
-            # 🆕 新しいautocast形式を使用
-            if use_bf16:
-                with autocast(device_type='cuda', dtype=torch.bfloat16):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs.loss / loss_divisor
-            else:
-                with autocast(enabled=False):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs.loss / loss_divisor
-
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            if (batch_idx + 1) % config.accumulation_steps == 0:
-                if config.gradient_clip > 0:
-                    if scaler:
-                        scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+    dtype = torch.bfloat16 if use_bf16 else torch.float16
+    
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
+    
+    for batch_idx, batch in enumerate(pbar):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        
+        # 混合精度学習
+        if config.use_amp and device.type == "cuda":
+            with autocast(dtype=dtype):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
                 
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
+                # 🆕 Focal Lossまたは通常の損失
+                if criterion is not None:
+                    loss = criterion(outputs.logits, labels)
                 else:
-                    optimizer.step()
+                    loss = outputs.loss
                 
-                if scheduler:
-                    scheduler.step()
-
-            batch_loss = loss.item() * loss_divisor
-            total_loss += batch_loss
-            pbar.set_postfix(loss=f"{batch_loss:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+                loss = loss / config.accumulation_steps
+        else:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
             
+            if criterion is not None:
+                loss = criterion(outputs.logits, labels)
+            else:
+                loss = outputs.loss
+            
+            loss = loss / config.accumulation_steps
+        
+        # 逆伝播
+        if scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # 勾配蓄積
+        if (batch_idx + 1) % config.accumulation_steps == 0:
+            if config.gradient_clip > 0:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            
+            if scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            
+            # 🆕 EMAの更新
+            if ema is not None:
+                ema.update()
+            
+            if scheduler:
+                scheduler.step()
+            
+            optimizer.zero_grad()
+        
+        batch_loss = loss.item() * config.accumulation_steps
+        total_loss += batch_loss
+        pbar.set_postfix(
+            loss=f"{batch_loss:.4f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}"
+        )
+    
     return total_loss
 
 
+# ===============================
+# 6. メイン学習関数（拡張版）
+# ===============================
 def train_model(config: TrainingConfig):
-    """最適化された学習関数(リファクタリング版)"""
-    device, tokenizer, model = setup_training(config)
-    train_loaders, val_loader, dataset = create_dataloaders(config, tokenizer)
-    optimizer, scheduler = create_optimizer_and_scheduler(model, config, train_loaders)
+    """
+    🆕 新機能搭載版の学習関数
+    - Focal Loss
+    - Label Smoothing
+    - EMA
+    - LR Finder
+    """
+    # 保存ディレクトリを事前に作成
+    os.makedirs(config.save_dir, exist_ok=True)
     
+    device, tokenizer, model = setup_training(config)
+    train_loader, val_loader = create_dataloaders(config, tokenizer)
+    optimizer, scheduler = create_optimizer_and_scheduler(model, config, train_loader)
+    
+    # 🆕 LR Finderの実行
+    if config.use_lr_finder:
+        logger.info("\n" + "="*60)
+        logger.info("🔍 Running LR Finder...")
+        logger.info("="*60)
+        
+        # 仮の損失関数（LR Finder用）
+        temp_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        lr_finder = LRFinder(model, optimizer, temp_criterion, device)
+        
+        suggested_lr = lr_finder.find(
+            train_loader,
+            min_lr=config.lr_finder_min,
+            max_lr=config.lr_finder_max,
+            num_iter=config.lr_finder_num_iter
+        )
+        
+        # グラフを保存
+        lr_finder.plot(os.path.join(config.save_dir, "lr_finder_plot.png"))
+        
+        # 学習率を更新
+        config.learning_rate = suggested_lr
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = suggested_lr
+        
+        logger.info(f"✅ Learning rate updated to: {suggested_lr:.2e}\n")
+    
+    # 🆕 Focal Lossの設定
+    criterion = None
+    if config.use_focal_loss:
+        criterion = FocalLoss(
+            alpha=config.focal_alpha,
+            gamma=config.focal_gamma
+        )
+        logger.info(f"✅ Focal Loss enabled (alpha={config.focal_alpha}, gamma={config.focal_gamma})")
+    
+    # 🆕 EMAの設定
+    ema = None
+    if config.use_ema:
+        ema = EMA(model, decay=config.ema_decay)
+        ema.register()
+    
+    # 混合精度学習の設定
     use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     if config.use_bfloat16 and not use_bf16:
         logger.warning("⚠️ BFloat16 requested but not supported. Falling back to FP16.")
     
     scaler = GradScaler() if config.use_amp and device.type == "cuda" and not use_bf16 else None
     
+    # Early Stopping
     early_stopping = EarlyStopping(patience=config.patience)
     best_val_loss = float('inf')
-    os.makedirs(config.save_dir, exist_ok=True)
     
-    freeze_encoder_layers(model, ratio=0.5)
-    logger.info("🔒 Encoder layers partially frozen (ratio=0.5)")
-
+    logger.info("\n" + "="*60)
+    logger.info("🚀 Starting Training...")
+    logger.info("="*60 + "\n")
+    
+    # 学習ループ
     for epoch in range(config.epochs):
-        start_prob, end_prob = 0.5, 0.1
-        current_prob = start_prob + (end_prob - start_prob) * (epoch / max(1, config.epochs - 1))
+        train_loss = train_epoch(
+            model, train_loader, optimizer, scheduler, scaler, 
+            device, config, epoch, criterion, ema
+        )
         
-        # RandomSpanデータセットにmulti_probを設定
-        for ds in dataset.datasets:
-            if isinstance(ds, TranslationDatasetRandomSpan):
-                ds.set_multi_prob(current_prob)
-        logger.info(f"📉 RandomSpan multi_prob = {current_prob:.2f}")
-
-        train_loss = train_epoch(model, train_loaders, optimizer, scheduler, scaler, device, config, epoch)
+        # 検証
+        val_loss = evaluate_model(
+            model, val_loader, device, criterion,
+            use_ema=config.use_ema, ema=ema
+        )
         
-        if epoch == 1:
-            for p in model.parameters():
-                p.requires_grad = True
-            logger.info("🔓 Encoder fully unfrozen")
-
-        val_loss = evaluate_model(model, val_loader, device)
-        total_train_samples = sum(len(l.dataset) for l in train_loaders)
-        avg_train_loss = train_loss / total_train_samples if total_train_samples > 0 else 0
-        logger.info(f"📊 Epoch {epoch+1}/{config.epochs} -> Train loss: {avg_train_loss:.4f}, Validation loss: {val_loss:.4f}")
+        avg_train_loss = train_loss / len(train_loader.dataset)
         
+        logger.info(
+            f"📊 Epoch {epoch+1}/{config.epochs} -> "
+            f"Train loss: {avg_train_loss:.4f}, "
+            f"Val loss: {val_loss:.4f}"
+        )
+        
+        # ベストモデルの保存
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_path = os.path.join(config.save_dir, "best_model")
-            model.save_pretrained(save_path)
+            
+            # 🆕 EMAモデルを保存
+            if config.use_ema and ema is not None:
+                ema.apply_shadow()
+                model.save_pretrained(save_path)
+                ema.restore()
+            else:
+                model.save_pretrained(save_path)
+            
             tokenizer.save_pretrained(save_path)
             logger.info(f"⭐ New best model saved to {save_path}!")
         
+        # Early Stopping
         early_stopping(val_loss)
         if early_stopping.early_stop:
             logger.info(f"🛑 Early stopping triggered at epoch {epoch+1}")
@@ -687,7 +788,7 @@ def train_model(config: TrainingConfig):
 
 
 # ===============================
-# 6. 翻訳関数
+# 7. 翻訳関数
 # ===============================
 def translate(model, tokenizer, text, max_length=64, num_beams=4):
     if hasattr(tokenizer, 'supported_language_codes'):
@@ -716,27 +817,31 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
 
 
 # ===============================
-# 🆕 7. モック実行用のヘルパー関数
+# 8. モックテスト
 # ===============================
 def quick_mock_test():
-    """構文チェック用のクイックテスト"""
     logger.info("\n" + "="*60)
-    logger.info("🧪 QUICK MOCK TEST - Syntax and Basic Functionality Check")
+    logger.info("🧪 ENHANCED MOCK TEST - Testing New Features")
     logger.info("="*60 + "\n")
     
     config = TrainingConfig(
         model_name="Helsinki-NLP/opus-mt-en-jap",
-        file_paths=[],  # モックモードでは不要
-        epochs=1,
+        file_paths=[],
+        epochs=2,
         batch_size=4,
         mock_mode=True,
-        mock_samples=20,
+        mock_samples=50,
         mock_force_cpu=True,
         num_workers=0,
-        accumulation_steps=1,
+        accumulation_steps=2,
         use_amp=False,
         use_bfloat16=False,
-        save_dir="./mock_output"
+        save_dir="./mock_output",
+        use_focal_loss=True,
+        use_label_smoothing=True,
+        use_ema=True,
+        use_lr_finder=True,
+        lr_finder_num_iter=20  # モック用に短縮
     )
     
     try:
@@ -744,17 +849,17 @@ def quick_mock_test():
         
         # 翻訳テスト
         logger.info("\n🧪 Testing translation...")
-        test_sentences = ["I like apples.", "How are you?"]
+        test_sentences = ["I like apples.", "How are you?", "This is a test."]
         results = batch_translate(model, tokenizer, test_sentences)
         
         for en, ja in zip(test_sentences, results):
             logger.info(f"  EN: {en} -> JA: {ja}")
         
-        logger.info("\n✅ MOCK TEST PASSED - All syntax checks successful!")
+        logger.info("\n✅ ENHANCED MOCK TEST PASSED!")
         return True
         
     except Exception as e:
-        logger.error(f"\n❌ MOCK TEST FAILED: {e}")
+        logger.error(f"\n❌ ENHANCED MOCK TEST FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -764,29 +869,11 @@ def quick_mock_test():
 # 実行例
 # ===============================
 if __name__ == "__main__":
-    # 🆕 環境変数でモードを切り替え
     import sys
     
     if "--mock" in sys.argv or os.getenv("MOCK_MODE") == "1":
         # モックモードで実行
         quick_mock_test()
-    
-    elif "--mock-with-files" in sys.argv:
-        # モックファイルを生成して実行
-        logger.info("🎭 Creating mock JSONL files...")
-        mock_files = create_mock_jsonl_files(output_dir="./mock_data", num_files=2, samples_per_file=50)
-        
-        config = TrainingConfig(
-            model_name="Helsinki-NLP/opus-mt-en-jap",
-            file_paths=mock_files,
-            epochs=1,
-            batch_size=4,
-            mock_mode=True,
-            mock_force_cpu=True,
-            save_dir="./mock_output"
-        )
-        
-        model, tokenizer = train_model(config)
     
     else:
         # 通常モード（実際の学習）
@@ -798,23 +885,30 @@ if __name__ == "__main__":
             "./../data/all_outenjp.jsonl"
         ]
         
-        # 各ファイルに対応するタグ (必要に応じて設定)
-        # tags = [None, None, None, None, "[LYRICS]"]
-        tags = None
-       
         config = TrainingConfig(
             model_name="Helsinki-NLP/opus-mt-en-jap",
             file_paths=files,
-            epochs=2,
+            epochs=3,
             batch_size=16,
             max_samples_per_span_file=40000,
-            save_dir="./models/translation_model_final",
+            save_dir="./models/translation_model_enhanced",
             random_seed=42,
-            tags=tags,
             num_workers=4,
             accumulation_steps=4,
             use_bfloat16=True,
-            scheduler_type='onecycle'
+            scheduler_type='onecycle',
+            # 🆕 新機能を有効化
+            use_focal_loss=True,
+            focal_alpha=0.25,
+            focal_gamma=2.0,
+            use_label_smoothing=True,
+            label_smoothing=0.1,
+            use_ema=True,
+            ema_decay=0.9999,
+            use_lr_finder=True,
+            lr_finder_min=1e-7,
+            lr_finder_max=1e-2,
+            lr_finder_num_iter=100
         )
         
         model, tokenizer = train_model(config)
