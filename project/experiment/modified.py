@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, get_linear_schedule_with_warmup, DataCollatorForSeq2Seq
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, ConcatDataset, Subset
 from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 import random
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset
 import os
 from pathlib import Path
 import json
@@ -26,14 +26,7 @@ logger = logging.getLogger(__name__)
 # 🆕 新機能1: Focal Loss
 # ===============================
 class FocalLoss(nn.Module):
-    """
-    難しいサンプルにより注目するFocal Loss
-    
-    Args:
-        alpha: クラスバランス調整パラメータ
-        gamma: 焦点パラメータ（大きいほど難しいサンプルに注目）
-        reduction: 損失の集約方法
-    """
+    """難しいサンプルにより注目するFocal Loss"""
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -41,16 +34,9 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
         
     def forward(self, logits, targets, ignore_index=-100):
-        """
-        Args:
-            logits: (batch_size, seq_len, vocab_size)
-            targets: (batch_size, seq_len)
-        """
-        # logitsを2次元に変形
         logits_flat = logits.view(-1, logits.size(-1))
         targets_flat = targets.view(-1)
         
-        # ignore_indexをマスク
         mask = targets_flat != ignore_index
         valid_logits = logits_flat[mask]
         valid_targets = targets_flat[mask]
@@ -58,13 +44,8 @@ class FocalLoss(nn.Module):
         if valid_logits.size(0) == 0:
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
         
-        # クロスエントロピー損失
         ce_loss = F.cross_entropy(valid_logits, valid_targets, reduction='none')
-        
-        # p_t: 正解クラスの予測確率
         p_t = torch.exp(-ce_loss)
-        
-        # Focal Loss
         focal_loss = self.alpha * (1 - p_t) ** self.gamma * ce_loss
         
         if self.reduction == 'mean':
@@ -76,17 +57,10 @@ class FocalLoss(nn.Module):
 
 
 # ===============================
-# 🆕 新機能2: EMA (Exponential Moving Average)
+# 🆕 新機能2: EMA
 # ===============================
 class EMA:
-    """
-    モデルパラメータの指数移動平均を保持
-    学習の安定化と汎化性能向上に寄与
-    
-    Args:
-        model: 対象モデル
-        decay: 減衰率（0.999-0.9999が一般的）
-    """
+    """モデルパラメータの指数移動平均"""
     def __init__(self, model, decay=0.9999):
         self.model = model
         self.decay = decay
@@ -94,14 +68,12 @@ class EMA:
         self.backup = {}
         
     def register(self):
-        """EMAの初期化"""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
         logger.info(f"✅ EMA registered with decay={self.decay}")
     
     def update(self):
-        """パラメータの移動平均を更新"""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
@@ -109,7 +81,6 @@ class EMA:
                 self.shadow[name] = new_average.clone()
     
     def apply_shadow(self):
-        """EMAパラメータをモデルに適用（評価時用）"""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
@@ -117,7 +88,6 @@ class EMA:
                 param.data = self.shadow[name]
     
     def restore(self):
-        """元のパラメータを復元（学習再開時用）"""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.backup
@@ -129,13 +99,7 @@ class EMA:
 # 🆕 新機能3: 学習率ファインダー
 # ===============================
 class LRFinder:
-    """
-    最適な学習率を自動探索
-    
-    使い方:
-        lr_finder = LRFinder(model, optimizer, criterion, device)
-        suggested_lr = lr_finder.find(train_loader, min_lr=1e-7, max_lr=1)
-    """
+    """最適な学習率を自動探索"""
     def __init__(self, model, optimizer, criterion, device):
         self.model = model
         self.optimizer = optimizer
@@ -144,26 +108,11 @@ class LRFinder:
         self.history = {'lr': [], 'loss': []}
         
     def find(self, train_loader, min_lr=1e-7, max_lr=1, num_iter=100, smooth_f=0.05):
-        """
-        学習率を徐々に上げながら損失を記録
-        
-        Args:
-            train_loader: 学習データローダー
-            min_lr: 最小学習率
-            max_lr: 最大学習率
-            num_iter: イテレーション数
-            smooth_f: 損失の平滑化係数
-        
-        Returns:
-            推奨学習率
-        """
         logger.info(f"🔍 LR Finder: Searching optimal learning rate ({min_lr} to {max_lr})...")
         
-        # モデルとオプティマイザの状態を保存
         model_state = copy.deepcopy(self.model.state_dict())
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
         
-        # 学習率スケジューラを設定（指数的に増加）
         mult = (max_lr / min_lr) ** (1 / num_iter)
         lr = min_lr
         self.optimizer.param_groups[0]['lr'] = lr
@@ -171,11 +120,10 @@ class LRFinder:
         avg_loss = 0.0
         best_loss = float('inf')
         batch_num = 0
-        losses = []
         
         iterator = iter(train_loader)
-        
         pbar = tqdm(range(num_iter), desc="LR Finder")
+        
         for iteration in pbar:
             try:
                 batch = next(iterator)
@@ -184,8 +132,6 @@ class LRFinder:
                 batch = next(iterator)
             
             batch_num += 1
-            
-            # 順伝播
             self.optimizer.zero_grad()
             
             input_ids = batch['input_ids'].to(self.device)
@@ -200,50 +146,38 @@ class LRFinder:
             
             loss = outputs.loss
             
-            # 移動平均で損失を平滑化
             if iteration == 0:
                 avg_loss = loss.item()
             else:
                 avg_loss = smooth_f * loss.item() + (1 - smooth_f) * avg_loss
             
-            # 最良損失を更新
             if avg_loss < best_loss:
                 best_loss = avg_loss
             
-            # 記録
             self.history['lr'].append(lr)
             self.history['loss'].append(avg_loss)
             
-            # 損失が発散したら停止
             if batch_num > 1 and avg_loss > 4 * best_loss:
                 logger.info(f"⚠️ Loss diverged, stopping LR finder")
                 break
             
-            # 逆伝播
             loss.backward()
             self.optimizer.step()
             
-            # 学習率を更新
             lr *= mult
             self.optimizer.param_groups[0]['lr'] = lr
-            
             pbar.set_postfix(lr=f"{lr:.2e}", loss=f"{avg_loss:.4f}")
         
-        # モデルとオプティマイザを復元
         self.model.load_state_dict(model_state)
         self.optimizer.load_state_dict(optimizer_state)
         
-        # 最適な学習率を提案（最小損失の1/10の位置）
         min_loss_idx = self.history['loss'].index(min(self.history['loss']))
         suggested_lr = self.history['lr'][max(0, min_loss_idx - len(self.history['lr']) // 10)]
         
         logger.info(f"✅ Suggested learning rate: {suggested_lr:.2e}")
-        
         return suggested_lr
     
     def plot(self, save_path="lr_finder_plot.png"):
-        """学習率vs損失のグラフを保存"""
-        # ディレクトリが存在しない場合は作成
         save_dir = os.path.dirname(save_path)
         if save_dir and not os.path.exists(save_dir):
             os.makedirs(save_dir, exist_ok=True)
@@ -256,17 +190,19 @@ class LRFinder:
         plt.title('Learning Rate Finder')
         plt.grid(True)
         plt.savefig(save_path)
-        plt.close()  # メモリリーク防止
+        plt.close()
         logger.info(f"📊 LR Finder plot saved to {save_path}")
 
 
 # ===============================
-# 0. 設定クラス（拡張版）
+# 0. 設定クラス
 # ===============================
+
 @dataclass
 class TrainingConfig:
     model_name: str
     file_paths: List[str]
+    file_types: List[int] = field(default_factory=list)  # 0=Span,1=ByWork,2=Practical(ByWork+Chunk)
     epochs: int = 3
     batch_size: int = 32
     use_amp: bool = True
@@ -274,6 +210,7 @@ class TrainingConfig:
     val_split: float = 0.05
     save_dir: str = "./models"
     learning_rate: float = 1e-4
+    weight_decay: float = 0.01
     gradient_clip: float = 1.0
     patience: int = 2
     max_len: int = 64
@@ -286,30 +223,31 @@ class TrainingConfig:
     scheduler_type: str = 'onecycle'
     warmup_steps: int = 500
     
-    # 🆕 新機能のパラメータ
+    # new
     use_focal_loss: bool = True
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
-    
     use_label_smoothing: bool = True
     label_smoothing: float = 0.1
-    
     use_ema: bool = True
     ema_decay: float = 0.9999
-    
     use_lr_finder: bool = True
     lr_finder_min: float = 1e-7
     lr_finder_max: float = 1e-2
     lr_finder_num_iter: int = 100
-    
-    # モックモード設定
+
+    # phase control: if None, defaults computed below
+    phase_epochs: Optional[List[int]] = None  # [phase1_epochs, phase2_epochs, phase3_epochs]
+
+    # mock mode...
     mock_mode: bool = False
     mock_samples: int = 100
     mock_force_cpu: bool = True
 
 
+
 # ===============================
-# 1. モックデータ生成（元のコードから）
+# 1. データ読み込み（元のコードから）
 # ===============================
 def generate_mock_data(num_samples=100, seed=42):
     """テスト用のモックデータを生成"""
@@ -330,11 +268,9 @@ def generate_mock_data(num_samples=100, seed=42):
              "movie", "game", "coffee", "tea", "flower", "bird", "cat", "tree"]
     
     en_list, ja_list = [], []
-    
     for i in range(num_samples):
         template_en, template_ja = random.choice(templates)
         word = random.choice(words)
-        
         en_list.append(template_en.format(word))
         ja_list.append(template_ja.format(word))
     
@@ -342,49 +278,339 @@ def generate_mock_data(num_samples=100, seed=42):
     return en_list, ja_list
 
 
+def add_tag_if_needed(text, tag):
+    """タグを追加するヘルパー関数"""
+    return f"{tag} {text}" if tag else text
+
+
+def is_chunk_delimiter(text):
+    """チャンク区切り行かどうかを判定"""
+    return "%%%%%%%%THISWORKENDSHERE%%%%%%%%" in text or "%%%%%%%%この作品ここまで%%%%%%%%" in text
+
+
+def load_single_dataset_streaming(file_path, max_samples=None, random_seed=42, tag=None):
+    """メモリ効率的にJSONLファイルを読み込み（区切り行を除外）"""
+    en_list, ja_list = [], []
+    error_count = 0
+    skipped_delimiters = 0
+    
+    logger.info(f"📖 Loading {file_path} ...")
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            if max_samples:
+                total_lines = sum(1 for _ in f)
+                f.seek(0)
+                
+                if total_lines > max_samples:
+                    logger.info(f"  ⚡ Sampling {max_samples} from {total_lines} lines")
+                    random.seed(random_seed)
+                    selected_indices = set(random.sample(range(total_lines), max_samples))
+                    
+                    for idx, line in enumerate(tqdm(f, total=total_lines,
+                                                    desc=f"Reading {os.path.basename(file_path)}",
+                                                    unit=" lines")):
+                        if idx in selected_indices:
+                            try:
+                                data = json.loads(line)
+                                en, ja = data.get("en"), data.get("ja")
+                                
+                                # 🆕 区切り行をスキップ
+                                if en and is_chunk_delimiter(en):
+                                    skipped_delimiters += 1
+                                    continue
+                                
+                                if en and ja and len(en.strip()) > 0 and len(ja.strip()) > 0:
+                                    en_list.append(add_tag_if_needed(en, tag))
+                                    ja_list.append(ja)
+                            except json.JSONDecodeError:
+                                error_count += 1
+                else:
+                    f.seek(0)
+                    for line in tqdm(f, total=total_lines,
+                                   desc=f"Reading {os.path.basename(file_path)}",
+                                   unit=" lines"):
+                        try:
+                            data = json.loads(line)
+                            en, ja = data.get("en"), data.get("ja")
+                            
+                            # 🆕 区切り行をスキップ
+                            if en and is_chunk_delimiter(en):
+                                skipped_delimiters += 1
+                                continue
+                            
+                            if en and ja and len(en.strip()) > 0 and len(ja.strip()) > 0:
+                                en_list.append(add_tag_if_needed(en, tag))
+                                ja_list.append(ja)
+                        except json.JSONDecodeError:
+                            error_count += 1
+            else:
+                for line in tqdm(f, desc=f"Reading {os.path.basename(file_path)}", unit=" lines"):
+                    try:
+                        data = json.loads(line)
+                        en, ja = data.get("en"), data.get("ja")
+                        
+                        # 🆕 区切り行をスキップ
+                        if en and is_chunk_delimiter(en):
+                            skipped_delimiters += 1
+                            continue
+                        
+                        if en and ja and len(en.strip()) > 0 and len(ja.strip()) > 0:
+                            en_list.append(add_tag_if_needed(en, tag))
+                            ja_list.append(ja)
+                    except json.JSONDecodeError:
+                        error_count += 1
+    
+    except FileNotFoundError:
+        logger.error(f"❌ File not found: {file_path}")
+        return [], []
+    except Exception as e:
+        logger.error(f"❌ Unexpected error loading {file_path}: {e}")
+        return [], []
+    
+    if error_count > 0:
+        logger.warning(f"  ⚠️  Skipped {error_count} invalid lines")
+    if skipped_delimiters > 0:
+        logger.info(f"  🔖 Skipped {skipped_delimiters} chunk delimiter lines")
+    
+    logger.info(f"  ✅ Loaded {len(en_list)} pairs from {os.path.basename(file_path)}")
+    return en_list, ja_list
+
+
+def load_chunks_from_file(file_path, tag=None):
+    """
+    🆕 ByWorkファイルからチャンク単位でデータを読み込み
+    
+    区切り行で分割し、各チャンク内の全文を結合した大きな翻訳ペアを作成
+    
+    Returns:
+        chunk_en_list: [チャンク1の全文結合, チャンク2の全文結合, ...]
+        chunk_ja_list: [チャンク1の全文結合, チャンク2の全文結合, ...]
+    """
+    chunk_en_list = []
+    chunk_ja_list = []
+    
+    current_en_chunk = []
+    current_ja_chunk = []
+    
+    logger.info(f"📚 Loading chunks from {file_path} ...")
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in tqdm(f, desc=f"Reading chunks {os.path.basename(file_path)}", unit=" lines"):
+                try:
+                    data = json.loads(line)
+                    en, ja = data.get("en"), data.get("ja")
+                    
+                    if not en or not ja:
+                        continue
+                    
+                    # 区切り行を検出
+                    if is_chunk_delimiter(en):
+                        # 現在のチャンクを保存
+                        if current_en_chunk and current_ja_chunk:
+                            # チャンク内の全文を結合
+                            combined_en = " ".join(current_en_chunk)
+                            combined_ja = " ".join(current_ja_chunk)
+                            
+                            chunk_en_list.append(add_tag_if_needed(combined_en, tag))
+                            chunk_ja_list.append(combined_ja)
+                        
+                        # 次のチャンク用にリセット
+                        current_en_chunk = []
+                        current_ja_chunk = []
+                    else:
+                        # 通常の行はチャンクに追加
+                        if len(en.strip()) > 0 and len(ja.strip()) > 0:
+                            current_en_chunk.append(en)
+                            current_ja_chunk.append(ja)
+                
+                except json.JSONDecodeError:
+                    continue
+        
+        # 最後のチャンクを保存
+        if current_en_chunk and current_ja_chunk:
+            combined_en = " ".join(current_en_chunk)
+            combined_ja = " ".join(current_ja_chunk)
+            chunk_en_list.append(add_tag_if_needed(combined_en, tag))
+            chunk_ja_list.append(combined_ja)
+    
+    except FileNotFoundError:
+        logger.error(f"❌ File not found: {file_path}")
+        return [], []
+    except Exception as e:
+        logger.error(f"❌ Unexpected error loading chunks from {file_path}: {e}")
+        return [], []
+    
+    logger.info(f"  ✅ Loaded {len(chunk_en_list)} chunks from {os.path.basename(file_path)}")
+    return chunk_en_list, chunk_ja_list
+
+
+def load_datasets_balanced(file_paths, file_types, max_samples_per_type=None, random_seed=42, tags=None):
+    if file_types is None:
+        file_types = [0] * len(file_paths)
+    """
+    ByWork系とRandomSpan系を分けてサンプリング
+    
+    🆕 ByWorkファイルは:
+    - 行単位データ（区切り行を除外）
+    - チャンク単位データ（区切り行で分割して結合）
+    の両方を返す
+    """
+    bywork_files = []
+    bywork_chunk_files = []  # 🆕 チャンク単位データ
+    span_files = []
+    
+    if tags is None:
+        tags = [None] * len(file_paths)
+    
+    for fp, tag, ftype in zip(file_paths, tags, file_types):
+        # ftype: 0 => RandomSpan, 1 => ByWork (line+chunk), 2 => Practical (ByWork + chunk, treated like 1 but flagged)
+        if ftype == 0:
+            logger.info(f"\n🎲 [SPAN-LEVEL] {fp}")
+            en_list, ja_list = load_single_dataset_streaming(fp, max_samples=max_samples_per_type, random_seed=random_seed, tag=tag)
+            span_files.append((fp, en_list, ja_list))
+        elif ftype in (1, 2):
+            logger.info(f"\n🎯 [WORK-LEVEL] {fp} (type={ftype})")
+            en_list, ja_list = load_single_dataset_streaming(fp, max_samples=None, random_seed=random_seed, tag=tag)
+            bywork_files.append((fp, en_list, ja_list))
+            chunk_en_list, chunk_ja_list = load_chunks_from_file(fp, tag=tag)
+            bywork_chunk_files.append((fp, chunk_en_list, chunk_ja_list))
+        else:
+            raise ValueError(f"Unknown file_types value: {ftype} for {fp}")
+
+    
+    # サマリー表示
+    logger.info("\n" + "="*60)
+    logger.info("📊 LOADING SUMMARY")
+    logger.info("="*60)
+    
+    total_bywork = sum(len(data[1]) for data in bywork_files)
+    logger.info(f"ByWork datasets (line-by-line): {len(bywork_files)} files, {total_bywork:,} pairs total")
+    for fp, en_list, _ in bywork_files:
+        logger.info(f"  - {os.path.basename(fp)}: {len(en_list):,} pairs")
+    
+    total_bywork_chunks = sum(len(data[1]) for data in bywork_chunk_files)
+    logger.info(f"\n🆕 ByWork datasets (chunk-level): {len(bywork_chunk_files)} files, {total_bywork_chunks:,} chunks total")
+    for fp, en_list, _ in bywork_chunk_files:
+        logger.info(f"  - {os.path.basename(fp)}: {len(en_list):,} chunks")
+    
+    total_span = sum(len(data[1]) for data in span_files)
+    logger.info(f"\nRandomSpan datasets: {len(span_files)} files, {total_span:,} pairs total")
+    for fp, en_list, _ in span_files:
+        logger.info(f"  - {os.path.basename(fp)}: {len(en_list):,} pairs")
+    
+    logger.info(f"\n🎉 GRAND TOTAL: {total_bywork + total_bywork_chunks + total_span:,} samples")
+    logger.info("="*60 + "\n")
+    
+    return bywork_files, bywork_chunk_files, span_files
+
 # ===============================
-# 2. データセットクラス（元のコードから簡略版）
+# 2. Datasetクラス（元のコードから）
 # ===============================
-class TranslationDataset(Dataset):
-    def __init__(self, en_list, ja_list, tokenizer, max_len=64):
-        self.en_list = en_list
-        self.ja_list = ja_list
+def build_randomspan_collator(tokenizer, label_smoothing=0.1):
+    return DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=None,
+        label_pad_token_id=-100,
+        padding=True,
+    )
+
+
+class TranslationDatasetRandomSpan(Dataset):
+    """RandomSpan系データ用Dataset"""
+    def __init__(self, en_texts, ja_texts, tokenizer, max_len=64, multi_prob=0.5):
+        self.en_texts = en_texts
+        self.ja_texts = ja_texts
         self.tokenizer = tokenizer
         self.max_len = max_len
-        
+        self.multi_prob = multi_prob
+
     def __len__(self):
-        return len(self.en_list)
-    
+        return len(self.en_texts)
+
+    def set_multi_prob(self, prob):
+        self.multi_prob = prob
+
     def __getitem__(self, idx):
-        en_text = self.en_list[idx]
-        ja_text = self.ja_list[idx]
+        en_text = self.en_texts[idx]
+        ja_text = self.ja_texts[idx]
         
         if hasattr(self.tokenizer, 'supported_language_codes'):
             en_text = ">>jap<< " + en_text
-        
-        inputs = self.tokenizer(
-            en_text,
-            max_length=self.max_len,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        targets = self.tokenizer(
-            ja_text,
-            max_length=self.max_len,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        labels = targets['input_ids'].squeeze()
-        labels[labels == self.tokenizer.pad_token_id] = -100
-        
+
+        # マルチセンテンス化
+        if random.random() < self.multi_prob and idx + 1 < len(self.en_texts):
+            en_text = en_text + " " + self.en_texts[idx + 1]
+            ja_text = ja_text + " " + self.ja_texts[idx + 1]
+
+        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding=False)
+        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding=False)
+
         return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'labels': labels
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "labels": labels["input_ids"]
+        }
+
+
+class TranslationDatasetByWork(Dataset):
+    """ByWork系データ用Dataset（行単位）"""
+    def __init__(self, en_texts, ja_texts, tokenizer, max_len=64):
+        self.en_texts = en_texts
+        self.ja_texts = ja_texts
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.en_texts)
+
+    def __getitem__(self, idx):
+        en_text = self.en_texts[idx]
+        ja_text = self.ja_texts[idx]
+        
+        if hasattr(self.tokenizer, 'supported_language_codes'):
+            en_text = ">>jap<< " + en_text
+
+        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding="max_length")
+        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding="max_length")
+
+        return {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "labels": labels["input_ids"]
+        }
+
+
+class TranslationDatasetByWorkChunk(Dataset):
+    """
+    🆕 ByWork系データ用Dataset（チャンク単位）
+    
+    区切り行で分割された作品チャンク全体を結合した大きな翻訳ペアとして学習
+    """
+    def __init__(self, en_chunks, ja_chunks, tokenizer, max_len=512):
+        self.en_chunks = en_chunks
+        self.ja_chunks = ja_chunks
+        self.tokenizer = tokenizer
+        self.max_len = max_len  # チャンクは長いので大きめのmax_len
+
+    def __len__(self):
+        return len(self.en_chunks)
+
+    def __getitem__(self, idx):
+        en_text = self.en_chunks[idx]
+        ja_text = self.ja_chunks[idx]
+        
+        if hasattr(self.tokenizer, 'supported_language_codes'):
+            en_text = ">>jap<< " + en_text
+
+        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding="max_length")
+        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding="max_length")
+
+        return {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "labels": labels["input_ids"]
         }
 
 
@@ -392,45 +618,97 @@ class TranslationDataset(Dataset):
 # 3. Early Stopping
 # ===============================
 class EarlyStopping:
-    def __init__(self, patience=2, min_delta=0.0):
+    def __init__(self, patience=2):
         self.patience = patience
-        self.min_delta = min_delta
         self.counter = 0
-        self.best_loss = None
+        self.best_loss = float('inf')
         self.early_stop = False
-        
+
     def __call__(self, val_loss):
-        if self.best_loss is None:
+        if val_loss < self.best_loss:
             self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
+            self.counter = 0
+        else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
 
 
 # ===============================
-# 4. セットアップ関数（拡張版）
+# 4. 学習補助関数
+# ===============================
+def freeze_encoder_layers(model, ratio=0.5):
+    """Encoderの一部レイヤーを凍結"""
+    if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
+        encoder = model.model.encoder
+    elif hasattr(model, 'encoder'):
+        encoder = model.encoder
+    else:
+        logger.warning("⚠️ Could not find encoder to freeze")
+        return
+
+    if hasattr(encoder, 'layers'):
+        total_layers = len(encoder.layers)
+        freeze_count = int(total_layers * ratio)
+        for i, layer in enumerate(encoder.layers):
+            if i < freeze_count:
+                for param in layer.parameters():
+                    param.requires_grad = False
+        logger.info(f"🔒 Frozen {freeze_count}/{total_layers} encoder layers")
+
+
+def evaluate_model(model, val_loader, device, criterion=None, use_ema=False, ema=None):
+    """検証ループ"""
+    model.eval()
+    
+    if use_ema and ema is not None:
+        ema.apply_shadow()
+    
+    total_loss = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            
+            if criterion is not None:
+                loss = criterion(outputs.logits, labels)
+            else:
+                loss = outputs.loss
+            
+            total_loss += loss.item()
+    
+    if use_ema and ema is not None:
+        ema.restore()
+    
+    model.train()
+    return total_loss / len(val_loader)
+
+
+# ===============================
+# 5. セットアップ関数
 # ===============================
 def setup_training(config: TrainingConfig):
-    """学習環境のセットアップ"""
-    torch.manual_seed(config.random_seed)
-    random.seed(config.random_seed)
-    
-    # デバイス設定
-    if config.mock_mode and config.mock_force_cpu:
-        device = torch.device("cpu")
-        logger.info("🖥️  Using CPU (Mock Mode)")
+    """デバイス、モデル、トークナイザーの初期化"""
+    if config.mock_mode:
+        logger.info("🎭 " + "="*60)
+        logger.info("🎭 MOCK MODE ENABLED - Running with synthetic data")
+        logger.info("🎭 " + "="*60)
+        
+        if config.mock_force_cpu:
+            device = torch.device("cpu")
+            logger.info("🎭 Forcing CPU for mock mode")
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"🖥️  Using device: {device}")
     
-    # モデルとトークナイザの読み込み
-    logger.info(f"📦 Loading model: {config.model_name}")
+    logger.info(f"🔧 Device: {device}")
+    
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name).to(device)
     
     # 🆕 Label Smoothingの設定
     if config.use_label_smoothing:
@@ -438,357 +716,582 @@ def setup_training(config: TrainingConfig):
             model.config.label_smoothing = config.label_smoothing
             logger.info(f"✅ Label Smoothing enabled: {config.label_smoothing}")
     
-    model = model.to(device)
+    if config.use_compile and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+            logger.info("⚡ Model compiled with torch.compile")
+        except Exception as e:
+            logger.warning(f"⚠️ torch.compile failed: {e}")
     
     return device, tokenizer, model
 
 
 def create_dataloaders(config: TrainingConfig, tokenizer):
-    """データローダーの作成"""
+    """
+    データローダーの作成（RandomSpan, ByWork, Practical を区別）
+    戻り値: (train_loaders, val_loader, dataset, loaders_map)
+    loaders_map keys: "span", "bywork", "chunk", "practical_line", "practical_chunk"
+    """
+    # データ読み込み
     if config.mock_mode:
-        en_list, ja_list = generate_mock_data(config.mock_samples, config.random_seed)
+        logger.info(f"🎭 Generating {config.mock_samples} mock samples...")
+        en_list, ja_list = generate_mock_data(config.mock_samples, seed=config.random_seed)
+        span_files = [("mock_data", en_list, ja_list)]
+        bywork_files = []
+        bywork_chunk_files = []
+        practical_line_files = []
+        practical_chunk_files = []
     else:
-        # 実際のデータ読み込み（簡略化）
-        en_list, ja_list = [], []
-        for file_path in config.file_paths:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        data = json.loads(line)
-                        if 'en' in data and 'ja' in data:
-                            en_list.append(data['en'])
-                            ja_list.append(data['ja'])
-            except FileNotFoundError:
-                logger.warning(f"⚠️ File not found: {file_path}")
-    
-    # データセット作成
-    full_dataset = TranslationDataset(en_list, ja_list, tokenizer, config.max_len)
-    
-    # Train/Val分割
-    val_size = int(len(full_dataset) * config.val_split)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, 
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(config.random_seed)
-    )
-    
-    # DataLoader作成
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers if not config.mock_mode else 0,
-        pin_memory=True if not config.mock_mode else False
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers if not config.mock_mode else 0,
-        pin_memory=True if not config.mock_mode else False
-    )
-    
-    logger.info(f"📊 Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    return train_loader, val_loader
+        # file_types を渡す
+        if not hasattr(config, "file_types") or not config.file_types:
+            raise ValueError("❌ config.file_types must be provided (list of ints matching file_paths)")
+        bywork_files, bywork_chunk_files, span_files = load_datasets_balanced(
+            config.file_paths,
+            config.file_types,
+            max_samples_per_type=config.max_samples_per_span_file,
+            random_seed=config.random_seed,
+            tags=config.tags
+        )
 
+    # ファイルタイプマップ（file_paths に基づく簡易参照）
+    file_type_map = {}
+    if hasattr(config, "file_types") and config.file_paths:
+        for fp, ftype in zip(config.file_paths, config.file_types):
+            file_type_map[fp] = ftype
 
-def create_optimizer_and_scheduler(model, config: TrainingConfig, train_loader):
-    """オプティマイザとスケジューラの作成"""
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=0.01
-    )
-    
-    total_steps = len(train_loader) * config.epochs // config.accumulation_steps
-    
-    if config.scheduler_type == 'onecycle':
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=config.learning_rate,
-            total_steps=total_steps,
-            pct_start=0.1
+    # データセット作成：non-practical は all_datasets に入れ、practical は別に貯める
+    all_datasets = []
+    practical_line_datasets = []
+    practical_chunk_datasets = []
+    bywork_chunk_datasets_nonpractical = []
+
+    # RandomSpan 系（基本は all_datasets に入れる）
+    for fp, en_list, ja_list in span_files:
+        ds = TranslationDatasetRandomSpan(en_list, ja_list, tokenizer, max_len=config.max_len)
+        all_datasets.append(ds)
+
+    # ByWork 行単位: file_type_map で practical 判定
+    for fp, en_list, ja_list in bywork_files:
+        ds = TranslationDatasetByWork(en_list, ja_list, tokenizer, max_len=config.max_len)
+        if file_type_map.get(fp) == 2:
+            practical_line_datasets.append((fp, ds))
+        else:
+            all_datasets.append(ds)
+
+    # ByWork チャンク単位
+    for fp, en_list, ja_list in bywork_chunk_files:
+        ds = TranslationDatasetByWorkChunk(en_list, ja_list, tokenizer, max_len=512)
+        if file_type_map.get(fp) == 2:
+            practical_chunk_datasets.append((fp, ds))
+        else:
+            bywork_chunk_datasets_nonpractical.append((fp, ds))
+
+    # safety: all_datasets が空の場合でも ConcatDataset を作れるようにする
+    if all_datasets:
+        dataset = ConcatDataset(all_datasets)
+    else:
+        # 空のダミーデータセットを用意（random_split 等で問題が起きないように）
+        empty_ds = TranslationDatasetRandomSpan([], [], tokenizer, max_len=config.max_len)
+        dataset = ConcatDataset([empty_ds])
+
+    # Train/Val 分割（non-practical の合成 dataset に対して）
+    total_len = len(dataset)
+    val_size = int(total_len * config.val_split)
+    train_size = total_len - val_size
+
+    # random_split は Dataset を受け取る
+    if total_len > 0:
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    else:
+        train_dataset = Subset(dataset, [])
+        val_dataset = Subset(dataset, [])
+
+    logger.info(f"📊 Train: {len(train_dataset)} samples, Validation: {len(val_dataset)} samples")
+
+    # 元のコードに倣って RandomSpan / ByWork のインデックスを計算
+    span_indices = []
+    bywork_indices = []
+    offset = 0
+    for ds in dataset.datasets:
+        ds_len = len(ds)
+        if isinstance(ds, TranslationDatasetRandomSpan):
+            span_indices.extend(range(offset, offset + ds_len))
+        elif isinstance(ds, TranslationDatasetByWork):
+            bywork_indices.extend(range(offset, offset + ds_len))
+        offset += ds_len
+
+    train_span_indices = [i for i in train_dataset.indices] if hasattr(train_dataset, 'indices') else []
+    train_bywork_indices = [i for i in train_dataset.indices] if hasattr(train_dataset, 'indices') else []
+    # 上の二つはフィルタをかけて分離する（元のロジック）
+    train_span_indices = [i for i in train_dataset.indices if i in span_indices] if hasattr(train_dataset, 'indices') else []
+    train_bywork_indices = [i for i in train_dataset.indices if i in bywork_indices] if hasattr(train_dataset, 'indices') else []
+
+    train_span = Subset(dataset, train_span_indices)
+    train_bywork = Subset(dataset, train_bywork_indices)
+
+    # non-practical chunk データセットをまとめて Train/Val 分割（もしあれば）
+    if bywork_chunk_datasets_nonpractical:
+        chunk_dataset = ConcatDataset([ds for _, ds in bywork_chunk_datasets_nonpractical])
+        chunk_val_size = int(len(chunk_dataset) * config.val_split)
+        chunk_train_size = len(chunk_dataset) - chunk_val_size
+        train_chunk_dataset, val_chunk_dataset = random_split(chunk_dataset, [chunk_train_size, chunk_val_size])
+        logger.info(f"📚 Chunk data: Train {len(train_chunk_dataset):,}, Val {len(val_chunk_dataset):,}")
+    else:
+        train_chunk_dataset = None
+        val_chunk_dataset = None
+
+    # Practical datasets の Train/Val 分割（もしあれば）
+    if practical_line_datasets:
+        practical_line_dataset = ConcatDataset([ds for _, ds in practical_line_datasets])
+        p_line_val_size = int(len(practical_line_dataset) * config.val_split)
+        p_line_train_size = len(practical_line_dataset) - p_line_val_size
+        train_practical_line, val_practical_line = random_split(practical_line_dataset, [p_line_train_size, p_line_val_size])
+    else:
+        train_practical_line = None
+        val_practical_line = None
+
+    if practical_chunk_datasets:
+        practical_chunk_dataset = ConcatDataset([ds for _, ds in practical_chunk_datasets])
+        p_chunk_val_size = int(len(practical_chunk_dataset) * config.val_split)
+        p_chunk_train_size = len(practical_chunk_dataset) - p_chunk_val_size
+        train_practical_chunk, val_practical_chunk = random_split(practical_chunk_dataset, [p_chunk_train_size, p_chunk_val_size])
+    else:
+        train_practical_chunk = None
+        val_practical_chunk = None
+
+    # Collator（RandomSpan 用）
+    span_collator = build_randomspan_collator(tokenizer, label_smoothing=config.label_smoothing)
+
+    # DataLoader の共通引数
+    loader_args = {
+        'num_workers': 0 if config.mock_mode else config.num_workers,
+        'pin_memory': False if config.mock_mode else True,
+        'persistent_workers': False
+    }
+
+    actual_batch_size = config.batch_size
+    bywork_batch_size = max(1, config.batch_size // 4)
+    chunk_batch_size = max(1, config.batch_size // 8)
+
+    train_loaders = []
+
+    # RandomSpan ローダー（mixed training の中核）
+    if len(train_span) > 0:
+        train_loader_span = DataLoader(
+            train_span,
+            batch_size=actual_batch_size,
+            shuffle=True,
+            collate_fn=span_collator,
+            **loader_args
+        )
+        train_loaders.append(train_loader_span)
+        logger.info(f"✅ RandomSpan loader: {len(train_span)} samples, batch_size={actual_batch_size}")
+    else:
+        train_loader_span = None
+
+    # ByWork 行単位ローダー（non-practical）
+    if len(train_bywork) > 0:
+        train_loader_bywork = DataLoader(
+            train_bywork,
+            batch_size=bywork_batch_size,
+            shuffle=True,
+            **loader_args
+        )
+        train_loaders.append(train_loader_bywork)
+        logger.info(f"✅ ByWork (line) loader: {len(train_bywork)} samples, batch_size={bywork_batch_size}")
+    else:
+        train_loader_bywork = None
+
+    # Non-practical chunk ローダー
+    if train_chunk_dataset is not None and len(train_chunk_dataset) > 0:
+        train_loader_chunk = DataLoader(
+            train_chunk_dataset,
+            batch_size=chunk_batch_size,
+            shuffle=True,
+            **loader_args
+        )
+        train_loaders.append(train_loader_chunk)
+        logger.info(f"✅ ByWork (chunk) loader: {len(train_chunk_dataset)} chunks, batch_size={chunk_batch_size}")
+    else:
+        train_loader_chunk = None
+
+    # Practical 専用ローダー（line / chunk）
+    if train_practical_line is not None and len(train_practical_line) > 0:
+        train_loader_practical_line = DataLoader(
+            train_practical_line,
+            batch_size=bywork_batch_size,
+            shuffle=True,
+            **loader_args
+        )
+        logger.info(f"✅ Practical (line) loader: {len(train_practical_line)} samples, batch_size={bywork_batch_size}")
+    else:
+        train_loader_practical_line = None
+
+    if train_practical_chunk is not None and len(train_practical_chunk) > 0:
+        train_loader_practical_chunk = DataLoader(
+            train_practical_chunk,
+            batch_size=chunk_batch_size,
+            shuffle=True,
+            **loader_args
+        )
+        logger.info(f"✅ Practical (chunk) loader: {len(train_practical_chunk)} chunks, batch_size={chunk_batch_size}")
+    else:
+        train_loader_practical_chunk = None
+
+    if not train_loaders and train_loader_practical_line is None and train_loader_practical_chunk is None:
+        raise ValueError("❌ No training loaders created!")
+
+    # Validation ローダー（non-practical val と practical val をまとめる）
+    combined_val_datasets = []
+    if len(val_dataset) > 0:
+        combined_val_datasets.append(val_dataset)
+    if val_chunk_dataset is not None and len(val_chunk_dataset) > 0:
+        combined_val_datasets.append(val_chunk_dataset)
+    if val_practical_line is not None and len(val_practical_line) > 0:
+        combined_val_datasets.append(val_practical_line)
+    if val_practical_chunk is not None and len(val_practical_chunk) > 0:
+        combined_val_datasets.append(val_practical_chunk)
+
+    if combined_val_datasets:
+        combined_val = ConcatDataset(combined_val_datasets) if len(combined_val_datasets) > 1 else combined_val_datasets[0]
+        val_loader = DataLoader(
+            combined_val,
+            batch_size=actual_batch_size * 2,
+            shuffle=False,
+            collate_fn=span_collator,
+            **loader_args
         )
     else:
+        # 空の validation
+        empty_val_ds = TranslationDatasetRandomSpan([], [], tokenizer, max_len=config.max_len)
+        val_loader = DataLoader(
+            empty_val_ds,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=span_collator,
+            **loader_args
+        )
+
+    # loaders_map を作って返却（phase 制御で使いやすいように）
+    loaders_map = {
+        "span": train_loader_span,
+        "bywork": train_loader_bywork,
+        "chunk": train_loader_chunk,
+        "practical_line": train_loader_practical_line,
+        "practical_chunk": train_loader_practical_chunk
+    }
+
+    return train_loaders, val_loader, dataset, loaders_map
+
+
+def create_optimizer_and_scheduler(model, config: TrainingConfig, train_loaders):
+    """オプティマイザとスケジューラの作成（weight_decay を尊重し、bias/LayerNorm には適用しない）"""
+    # パラメータグループ：bias と LayerNorm の weight decay を 0 にする
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 名前に 'bias' を含むか LayerNorm / layer_norm / LayerNorm を含む場合は no_decay
+        if name.endswith(".bias") or "layernorm" in name.lower() or "layer_norm" in name.lower() or "ln_" in name.lower():
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    param_groups = [
+        {"params": decay, "weight_decay": float(getattr(config, "weight_decay", 0.0))},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+    optimizer = torch.optim.AdamW(param_groups, lr=config.learning_rate)
+
+    # total steps 計算（train_loaders はリストの想定）
+    total_steps_per_epoch = sum(len(loader) for loader in train_loaders if loader is not None)
+    total_steps = 100*total_steps_per_epoch * config.epochs
+    if config.scheduler_type == 'onecycle':
+        # max_lr を config.learning_rate * 10 としている既存の方針を尊重
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=config.learning_rate * 10,
+            total_steps=max(1, total_steps),
+            pct_start=0.3,
+            anneal_strategy='cos',
+            div_factor=25.0,
+            final_div_factor=1e4
+        )
+        logger.info(f"📈 OneCycleLR scheduler initialized (total_steps={total_steps})")
+    elif config.scheduler_type == 'linear_warmup':
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=config.warmup_steps,
-            num_training_steps=total_steps
+            num_training_steps=max(1, total_steps)
         )
-    
+        logger.info(f"📈 Linear warmup scheduler initialized (warmup_steps={config.warmup_steps}, total_steps={total_steps})")
+    else:
+        scheduler = None
+
     return optimizer, scheduler
 
 
-# ===============================
-# 5. 学習・評価関数（拡張版）
-# ===============================
-def evaluate_model(model, val_loader, device, criterion=None, use_ema=False, ema=None):
-    """
-    モデルの評価
-    
-    Args:
-        model: 評価対象モデル
-        val_loader: 検証データローダー
-        device: デバイス
-        criterion: 損失関数（Noneの場合はモデルデフォルト）
-        use_ema: EMAモデルを使用するか
-        ema: EMAオブジェクト
-    """
-    model.eval()
-    
-    # 🆕 EMAパラメータを適用
-    if use_ema and ema is not None:
-        ema.apply_shadow()
-    
-    total_loss = 0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            if criterion is not None:
-                # Focal Lossを使用
-                loss = criterion(outputs.logits, labels)
-            else:
-                loss = outputs.loss
-            
-            total_loss += loss.item()
-            num_batches += 1
-    
-    # 🆕 EMAパラメータを元に戻す
-    if use_ema and ema is not None:
-        ema.restore()
-    
-    model.train()
-    return total_loss / num_batches if num_batches > 0 else 0
 
-
-def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, config, epoch, criterion=None, ema=None):
-    """
-    1エポックの学習
-    
-    Args:
-        criterion: 損失関数（Focal Loss等）
-        ema: EMAオブジェクト
-    """
+# ===============================
+# 6. 学習エポック関数
+# ===============================
+def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, epoch, criterion=None, ema=None):
+    """1エポック分の学習処理"""
     model.train()
     total_loss = 0
-    optimizer.zero_grad()
-    
     use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if use_bf16 else torch.float16
-    
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
-    
-    for batch_idx, batch in enumerate(pbar):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
-        
-        # 混合精度学習
-        if config.use_amp and device.type == "cuda":
-            with autocast(dtype=dtype):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+
+    for loader in loaders:
+        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
+        for batch_idx, batch in enumerate(pbar):
+            if batch_idx % config.accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            
+            loss_divisor = config.accumulation_steps
+            
+            if use_bf16:
+                with autocast(device_type='cuda', dtype=torch.bfloat16):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    
+                    if criterion is not None:
+                        loss = criterion(outputs.logits, labels) / loss_divisor
+                    else:
+                        loss = outputs.loss / loss_divisor
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 
-                # 🆕 Focal Lossまたは通常の損失
                 if criterion is not None:
-                    loss = criterion(outputs.logits, labels)
+                    loss = criterion(outputs.logits, labels) / loss_divisor
                 else:
-                    loss = outputs.loss
-                
-                loss = loss / config.accumulation_steps
-        else:
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            if criterion is not None:
-                loss = criterion(outputs.logits, labels)
-            else:
-                loss = outputs.loss
-            
-            loss = loss / config.accumulation_steps
-        
-        # 逆伝播
-        if scaler:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # 勾配蓄積
-        if (batch_idx + 1) % config.accumulation_steps == 0:
-            if config.gradient_clip > 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
-            
+                    loss = outputs.loss / loss_divisor
+
             if scaler:
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss).backward()
             else:
-                optimizer.step()
+                loss.backward()
+
+            if (batch_idx + 1) % config.accumulation_steps == 0:
+                if config.gradient_clip > 0:
+                    if scaler:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                
+                # 🆕 EMAの更新
+                if ema is not None:
+                    ema.update()
+                
+                if scheduler:
+                    scheduler.step()
+
+            batch_loss = loss.item() * loss_divisor
+            total_loss += batch_loss
+            pbar.set_postfix(loss=f"{batch_loss:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
             
-            # 🆕 EMAの更新
-            if ema is not None:
-                ema.update()
-            
-            if scheduler:
-                scheduler.step()
-            
-            optimizer.zero_grad()
-        
-        batch_loss = loss.item() * config.accumulation_steps
-        total_loss += batch_loss
-        pbar.set_postfix(
-            loss=f"{batch_loss:.4f}",
-            lr=f"{optimizer.param_groups[0]['lr']:.2e}"
-        )
-    
     return total_loss
 
 
 # ===============================
-# 6. メイン学習関数（拡張版）
+# 7. メイン学習関数
 # ===============================
 def train_model(config: TrainingConfig):
-    """
-    🆕 新機能搭載版の学習関数
-    - Focal Loss
-    - Label Smoothing
-    - EMA
-    - LR Finder
-    """
-    # 保存ディレクトリを事前に作成
+    """3-Phase 対応版の学習関数。戻り値は (model, tokenizer)."""
     os.makedirs(config.save_dir, exist_ok=True)
-    
+
     device, tokenizer, model = setup_training(config)
-    train_loader, val_loader = create_dataloaders(config, tokenizer)
-    optimizer, scheduler = create_optimizer_and_scheduler(model, config, train_loader)
-    
-    # 🆕 LR Finderの実行
-    if config.use_lr_finder:
+    train_loaders, val_loader, dataset, loaders_map = create_dataloaders(config, tokenizer)
+    # optimizer/scheduler は train_loaders（非-practical の混合ローダ群）を基に作成
+    optimizer, scheduler = create_optimizer_and_scheduler(model, config, train_loaders)
+
+    # --- LR Finder: span ローダーがあればそれを優先して使う ---
+    span_loader_for_lr = loaders_map.get("span") if isinstance(loaders_map, dict) else None
+    if not span_loader_for_lr and train_loaders:
+        span_loader_for_lr = train_loaders[0]
+
+    if config.use_lr_finder and span_loader_for_lr is not None:
         logger.info("\n" + "="*60)
         logger.info("🔍 Running LR Finder...")
         logger.info("="*60)
-        
-        # 仮の損失関数（LR Finder用）
         temp_criterion = nn.CrossEntropyLoss(ignore_index=-100)
         lr_finder = LRFinder(model, optimizer, temp_criterion, device)
-        
         suggested_lr = lr_finder.find(
-            train_loader,
+            span_loader_for_lr,
             min_lr=config.lr_finder_min,
             max_lr=config.lr_finder_max,
             num_iter=config.lr_finder_num_iter
         )
-        
-        # グラフを保存
         lr_finder.plot(os.path.join(config.save_dir, "lr_finder_plot.png"))
-        
-        # 学習率を更新
         config.learning_rate = suggested_lr
         for param_group in optimizer.param_groups:
             param_group['lr'] = suggested_lr
-        
         logger.info(f"✅ Learning rate updated to: {suggested_lr:.2e}\n")
-    
-    # 🆕 Focal Lossの設定
+
+    # --- criterion, EMA, scaler の初期化 ---
     criterion = None
     if config.use_focal_loss:
-        criterion = FocalLoss(
-            alpha=config.focal_alpha,
-            gamma=config.focal_gamma
-        )
+        criterion = FocalLoss(alpha=config.focal_alpha, gamma=config.focal_gamma)
         logger.info(f"✅ Focal Loss enabled (alpha={config.focal_alpha}, gamma={config.focal_gamma})")
-    
-    # 🆕 EMAの設定
+
     ema = None
     if config.use_ema:
         ema = EMA(model, decay=config.ema_decay)
         ema.register()
-    
-    # 混合精度学習の設定
+
     use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     if config.use_bfloat16 and not use_bf16:
         logger.warning("⚠️ BFloat16 requested but not supported. Falling back to FP16.")
-    
-    scaler = GradScaler() if config.use_amp and device.type == "cuda" and not use_bf16 else None
-    
-    # Early Stopping
+
+    scaler = GradScaler() if (config.use_amp and device.type == "cuda" and not use_bf16) else None
+
     early_stopping = EarlyStopping(patience=config.patience)
     best_val_loss = float('inf')
-    
+
+    # freeze encoder 初期化（ratio はハードコード済みの 0.5）
+    freeze_encoder_layers(model, ratio=0.5)
+    logger.info("🔒 Encoder layers partially frozen (ratio=0.5)")
+
     logger.info("\n" + "="*60)
-    logger.info("🚀 Starting Training...")
+    logger.info("🚀 Starting Training (3-Phase enabled)...")
     logger.info("="*60 + "\n")
-    
-    # 学習ループ
-    for epoch in range(config.epochs):
-        train_loss = train_epoch(
-            model, train_loader, optimizer, scheduler, scaler, 
-            device, config, epoch, criterion, ema
-        )
-        
-        # 検証
-        val_loss = evaluate_model(
-            model, val_loader, device, criterion,
-            use_ema=config.use_ema, ema=ema
-        )
-        
-        avg_train_loss = train_loss / len(train_loader.dataset)
-        
-        logger.info(
-            f"📊 Epoch {epoch+1}/{config.epochs} -> "
-            f"Train loss: {avg_train_loss:.4f}, "
-            f"Val loss: {val_loss:.4f}"
-        )
-        
-        # ベストモデルの保存
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_path = os.path.join(config.save_dir, "best_model")
-            
-            # 🆕 EMAモデルを保存
-            if config.use_ema and ema is not None:
-                ema.apply_shadow()
-                model.save_pretrained(save_path)
-                ema.restore()
-            else:
-                model.save_pretrained(save_path)
-            
-            tokenizer.save_pretrained(save_path)
-            logger.info(f"⭐ New best model saved to {save_path}!")
-        
-        # Early Stopping
-        early_stopping(val_loss)
+
+    # --- phase_epochs の決定 ---
+    if config.phase_epochs is None:
+        # practical がいるかどうかでデフォルト配分を決める
+        has_practical = hasattr(config, "file_types") and any(ft == 2 for ft in config.file_types)
+        if has_practical and config.epochs >= 3:
+            phase_epochs = [max(1, config.epochs - 2), 1, 1]
+        elif config.epochs == 2:
+            phase_epochs = [1, 1, 0]
+        else:
+            phase_epochs = [config.epochs, 0, 0]
+    else:
+        if len(config.phase_epochs) != 3 or sum(config.phase_epochs) != config.epochs:
+            raise ValueError("phase_epochs must be length-3 and sum to config.epochs")
+        phase_epochs = config.phase_epochs
+
+    logger.info(f"Phases epochs: {phase_epochs} (Phase1: mixed, Phase2: mixed+chunk, Phase3: practical)")
+
+    global_epoch = 0
+
+    # 便利な補助：loaders_map から利用可能なローダーを取り出す
+    span_loader = loaders_map.get("span") if isinstance(loaders_map, dict) else None
+    bywork_loader = loaders_map.get("bywork") if isinstance(loaders_map, dict) else None
+    chunk_loader = loaders_map.get("chunk") if isinstance(loaders_map, dict) else None
+    practical_line_loader = loaders_map.get("practical_line") if isinstance(loaders_map, dict) else None
+    practical_chunk_loader = loaders_map.get("practical_chunk") if isinstance(loaders_map, dict) else None
+
+    # Phase ごとのループ
+    for phase_idx, n_epochs in enumerate(phase_epochs):
+        if n_epochs <= 0:
+            continue
+
+        # Phase 切替時のログ
+        if phase_idx == 0:
+            # Phase1: 元の混合（train_loaders）を使う
+            phase_loaders = train_loaders
+            logger.info(f"--- PHASE 1 (mixed) : {n_epochs} epochs ---")
+        elif phase_idx == 1:
+            # Phase2: 優先的に chunk を含める混合。chunk がなければ train_loaders を使う
+            candidate = []
+            if chunk_loader is not None:
+                candidate.append(chunk_loader)
+            if bywork_loader is not None:
+                candidate.append(bywork_loader)
+            if span_loader is not None:
+                candidate.append(span_loader)
+            phase_loaders = candidate if candidate else train_loaders
+            logger.info(f"--- PHASE 2 (mixed + chunk) : {n_epochs} epochs ---")
+        else:
+            # Phase3: practical 集中特訓
+            practical_candidate = []
+            if practical_chunk_loader is not None:
+                practical_candidate.append(practical_chunk_loader)
+            if practical_line_loader is not None:
+                practical_candidate.append(practical_line_loader)
+            if not practical_candidate:
+                logger.info("No practical loaders found; skipping Phase 3.")
+                continue
+            phase_loaders = practical_candidate
+            logger.info(f"--- PHASE 3 (practical-focused) : {n_epochs} epochs ---")
+
+        # 各 phase の epoch ループ
+        for _ in range(n_epochs):
+            # RandomSpan の multi_prob を dataset 側の RandomSpan にだけ適用（dataset は non-practical の ConcatDataset）
+            # multi_prob の anneal は global_epoch に基づく（全体通しのスケジュール）
+            start_prob, end_prob = 0.5, 0.1
+            # total epochs may be 0 guard
+            total_epochs = max(1, config.epochs - 1)
+            current_prob = start_prob + (end_prob - start_prob) * (global_epoch / total_epochs)
+            # dataset.datasets が存在すれば RandomSpan に set_multi_prob をかける
+            if hasattr(dataset, "datasets"):
+                for ds in dataset.datasets:
+                    if isinstance(ds, TranslationDatasetRandomSpan):
+                        ds.set_multi_prob(current_prob)
+            logger.info(f"📉 RandomSpan multi_prob = {current_prob:.2f} (global_epoch={global_epoch})")
+
+            # 1 epoch の学習
+            train_loss = train_epoch(model, phase_loaders, optimizer, scheduler, scaler, device, config, global_epoch, criterion, ema)
+
+            # エポック経過に応じて最初の頃に encoder を完全 unfreeze する（従来の挙動を残す）
+            if global_epoch == 1:
+                for p in model.parameters():
+                    p.requires_grad = True
+                logger.info("🔓 Encoder fully unfrozen")
+
+            # 検証
+            val_loss = evaluate_model(model, val_loader, device, criterion, use_ema=config.use_ema, ema=ema)
+
+            # logging / 保存
+            # total_train_samples: phase_loaders の dataset を合計（分母）
+            try:
+                total_train_samples = sum(len(l.dataset) for l in (phase_loaders if isinstance(phase_loaders, list) else [phase_loaders]) if l is not None and hasattr(l, "dataset"))
+            except Exception:
+                total_train_samples = 0
+            avg_train_loss = train_loss / total_train_samples if total_train_samples > 0 else train_loss
+
+            logger.info(f"📊 Epoch {global_epoch+1}/{config.epochs} -> Train loss: {avg_train_loss:.4f}, Val loss: {val_loss:.4f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_path = os.path.join(config.save_dir, "best_model")
+                # EMA を適用して保存する
+                if config.use_ema and ema is not None:
+                    ema.apply_shadow()
+                    model.save_pretrained(save_path)
+                    ema.restore()
+                else:
+                    model.save_pretrained(save_path)
+                tokenizer.save_pretrained(save_path)
+                logger.info(f"⭐ New best model saved to {save_path}!")
+
+            # Early stopping 判定
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                logger.info(f"🛑 Early stopping triggered at global epoch {global_epoch+1}")
+                break
+
+            global_epoch += 1
+
         if early_stopping.early_stop:
-            logger.info(f"🛑 Early stopping triggered at epoch {epoch+1}")
             break
-    
+
     logger.info(f"\n✅ Training completed! Best validation loss: {best_val_loss:.4f}")
     return model, tokenizer
 
 
 # ===============================
-# 7. 翻訳関数
+# 8. 翻訳関数
 # ===============================
 def translate(model, tokenizer, text, max_length=64, num_beams=4):
     if hasattr(tokenizer, 'supported_language_codes'):
@@ -817,52 +1320,99 @@ def batch_translate(model, tokenizer, texts, batch_size=8, max_length=64, num_be
 
 
 # ===============================
-# 8. モックテスト
+# 9. モックテスト
 # ===============================
 def quick_mock_test():
     logger.info("\n" + "="*60)
-    logger.info("🧪 ENHANCED MOCK TEST - Testing New Features")
+    logger.info("🧪 ENHANCED MOCK TEST - Testing New Features (3-Phase)")
     logger.info("="*60 + "\n")
-    
+
+    # mock 用のダミーファイルパス（実際には読まれない）
+    file_paths = [
+        "mock_randomspan.txt",      # RandomSpan
+        "mock_bywork.txt",          # ByWork
+        "mock_practical.txt"        # Practical corpus
+    ]
+
+    # 0 = RandomSpan
+    # 1 = ByWork (line + chunk)
+    # 2 = Practical (line + chunk, Phase3 集中)
+    file_types = [0, 1, 2]
+
     config = TrainingConfig(
-        model_name="Helsinki-NLP/opus-mt-en-jap",
-        file_paths=[],
-        epochs=2,
-        batch_size=4,
+        # --- 基本 ---
+        model_name="facebook/mbart-large-50-many-to-many-mmt",
+        save_dir="./mock_output_complete",
+        random_seed=42,
+
+        # --- データ ---
+        file_paths=file_paths,
+        file_types=file_types,
+        tags=None,
+
+        # --- mock ---
         mock_mode=True,
         mock_samples=50,
-        mock_force_cpu=True,
+
+        # --- 学習設定 ---
+        epochs=3,
+        phase_epochs=[1, 1, 1],  # Phase1 / Phase2 / Phase3
+        batch_size=4,
+        max_len=128,
+        val_split=0.05,
+
+        # --- 最適化 ---
+        learning_rate=3e-4,
+        weight_decay=0.01,
         num_workers=0,
-        accumulation_steps=2,
+
+        # --- LR Finder ---
+        use_lr_finder=True,
+        lr_finder_min=1e-7,
+        lr_finder_max=1e-2,
+        lr_finder_num_iter=20,
+
+        # --- 損失・正則化 ---
+        use_focal_loss=True,
+        focal_alpha=0.25,
+        focal_gamma=2.0,
+        label_smoothing=0.1,
+
+        # --- EMA ---
+        use_ema=True,
+        ema_decay=0.9999,
+
+        # --- AMP ---
         use_amp=False,
         use_bfloat16=False,
-        save_dir="./mock_output",
-        use_focal_loss=True,
-        use_label_smoothing=True,
-        use_ema=True,
-        use_lr_finder=True,
-        lr_finder_num_iter=20  # モック用に短縮
+
+        # --- Early stopping ---
+        patience=5,
     )
-    
-    try:
-        model, tokenizer = train_model(config)
-        
-        # 翻訳テスト
-        logger.info("\n🧪 Testing translation...")
-        test_sentences = ["I like apples.", "How are you?", "This is a test."]
-        results = batch_translate(model, tokenizer, test_sentences)
-        
-        for en, ja in zip(test_sentences, results):
-            logger.info(f"  EN: {en} -> JA: {ja}")
-        
-        logger.info("\n✅ ENHANCED MOCK TEST PASSED!")
-        return True
-        
-    except Exception as e:
-        logger.error(f"\n❌ ENHANCED MOCK TEST FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+
+    model, tokenizer = train_model(config)
+
+    logger.info("\n🧪 Testing translation...")
+    test_sentences = [
+        "I like apples.",
+        "How are you?",
+        "This is a test."
+    ]
+
+    model.eval()
+    device = next(model.parameters()).device
+    for s in test_sentences:
+        inputs = tokenizer(s, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_length=50,
+                num_beams=4
+            )
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logger.info(f"  EN: {s} -> JA: {decoded}")
+
+    logger.info("\n✅ ENHANCED MOCK TEST PASSED!")
 
 
 # ===============================
@@ -872,28 +1422,31 @@ if __name__ == "__main__":
     import sys
     
     if "--mock" in sys.argv or os.getenv("MOCK_MODE") == "1":
-        # モックモードで実行
         quick_mock_test()
     
     else:
-        # 通常モード（実際の学習）
         files = [
-            "./../data/sepalated_dataset.jsonl",
+            "./../lyrics_dataset.jsonl"
+            "./../data/separated_literary_dataset.jsonl",
             "./../data/OpenSubtitles_sample_40000.jsonl",
             "./../data/TED_sample_40000.jsonl",
             "./../data/Tatoeba_sample_40000.jsonl",
             "./../data/all_outenjp.jsonl"
         ]
-        
+        file_values = [2,1,0,0,0,0]
         config = TrainingConfig(
             model_name="Helsinki-NLP/opus-mt-en-jap",
             file_paths=files,
-            epochs=3,
+            file_types = file_values,
+            epochs=5,
+            phase_epochs=[3,1,1],
             batch_size=16,
             max_samples_per_span_file=40000,
-            save_dir="./models/translation_model_enhanced",
+            save_dir="./models/translation_model_complete",
             random_seed=42,
             num_workers=4,
+            learning_rate=3e-4,
+            weight_decay=0.01,
             accumulation_steps=4,
             use_bfloat16=True,
             scheduler_type='onecycle',
@@ -913,7 +1466,6 @@ if __name__ == "__main__":
         
         model, tokenizer = train_model(config)
         
-        # 翻訳テスト
         test_sentences = [
             "I like apples.",
             "How are you?",
