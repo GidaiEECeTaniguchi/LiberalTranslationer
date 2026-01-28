@@ -106,6 +106,12 @@ def load_chunks(file_path, tag=None):
                 elif en and ja:
                     curr_en.append(en); curr_ja.append(ja)
             except: continue
+
+    # ✨ ループ終了後、残っているデータがあれば追加する
+    if curr_en:
+        chunks_en.append(f"{tag} {' '.join(curr_en)}" if tag else ' '.join(curr_en))
+        chunks_ja.append(' '.join(curr_ja))
+
     return chunks_en, chunks_ja
 
 # ===============================
@@ -152,7 +158,7 @@ def create_dataloaders(config, tokenizer):
         elif ftype == 2:
             en, ja = load_jsonl(path)
             # 20倍は多すぎたので、configで制御可能にするか5倍程度に抑える
-            factor = getattr(config, 'practical_upsample', 5)
+            factor = getattr(config, 'practical_upsample', 2)
             loaders_map["practical_line"] = ConcatDataset([TranslationDatasetByWork(en, ja, tokenizer, config.max_len)] * factor)
             
             cen, cja = load_chunks(path)

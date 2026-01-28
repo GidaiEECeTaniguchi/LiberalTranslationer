@@ -5,6 +5,7 @@ from tqdm import tqdm
 import logging
 import matplotlib.pyplot as plt
 import matplotlib
+import random
 # ヘッドレス環境（サーバー等）でのプロットエラー防止
 matplotlib.use('Agg')
 
@@ -106,27 +107,75 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience: self.early_stop = True
 
+
+
+def get_phase_loaders(phase_idx, loaders_map):
+    """
+    フェーズごとのローダーリスト（またはインターリーブ）を返す。
+    ここを1箇所書き換えるだけで、予測と実行の両方が同時に変わる。
+    """
+    if phase_idx == 0:
+        # Phase 1: 基礎
+        return [loaders_map["span"], loaders_map["bywork"]]
+    elif phase_idx == 1:
+        # Phase 2: 文脈
+        return [loaders_map["chunk"], loaders_map["bywork"], loaders_map["span"]]
+    else:
+        # Phase 3: 本命（インターリーブ）
+        p3_dict = {
+            "pc": loaders_map["practical_chunk"],
+            "pl": loaders_map["practical_line"],
+            "anchor": loaders_map["span"]
+        }
+        return [InterleavedLoaders(p3_dict, weights=[1.0, 1.0, 2.0])]
+
 def get_total_steps(phase_epochs, loaders_map, config):
-    """全フェーズの総更新ステップ数を正確に計算"""
     total_updates = 0
-    
     for phase_idx, n_epochs in enumerate(phase_epochs):
         if n_epochs <= 0: continue
         
-        # フェーズごとのローダー構成をシミュレート
-        if phase_idx == 0:
-            loaders = [loaders_map["span"], loaders_map["bywork"], loaders_map["chunk"]]
-        elif phase_idx == 1:
-            loaders = [loaders_map["chunk"], loaders_map["bywork"], loaders_map["span"]]
-        else:
-            # Phase 3: アンカー(span)を混ぜる
-            loaders = [loaders_map["practical_chunk"], loaders_map["practical_line"], loaders_map["span"]]
-            
-        phase_steps = sum(len(l) for l in loaders if l is not None)
-        total_updates += (phase_steps // config.accumulation_steps) * n_epochs
+        # 🆕 ここで共通関数を呼び出す
+        loaders = get_phase_loaders(phase_idx, loaders_map)
         
+        phase_it = sum(len(l) for l in loaders if l is not None)
+        total_updates += (phase_it // config.accumulation_steps) * n_epochs
     return total_updates
+#インターリーブ学習
+class InterleavedLoaders:
+    """
+    複数のDataLoaderをバッチ単位で混ぜ合わせる。
+    weightsを指定することで、特定のデータの出現頻度を調整可能。
+    """
+    def __init__(self, loaders_dict, weights=None):
+        # Noneを除外して有効なローダーだけを保持
+        self.loaders = {k: v for k, v in loaders_dict.items() if v is not None}
+        self.keys = list(self.loaders.keys())
+        self.weights = weights if weights else [1.0] * len(self.keys)
+        
+    def __iter__(self):
+        # 各ローダーをイテレータ化
+        iters = {k: iter(v) for k, v in self.loaders.items()}
+        finished = set()
 
+        while len(finished) < len(self.loaders):
+            # 重みに基づいて次に使うローダーを選択
+            active_keys = [k for k in self.keys if k not in finished]
+            if not active_keys: break
+            
+            # 確率的に選択
+            curr_key = random.choices(
+                active_keys, 
+                weights=[self.weights[self.keys.index(k)] for k in active_keys]
+            )[0]
+            
+            try:
+                yield next(iters[curr_key])
+            except StopIteration:
+                finished.add(curr_key)
+
+    def __len__(self):
+        # 全ローダーのバッチ数の合計
+        return sum(len(v) for v in self.loaders.values())
 # ===============================
 # 3. 学習コア
 # ===============================
@@ -134,7 +183,8 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
     model.train()
     total_loss = 0
     update_count = 0
-    
+    if not isinstance(loaders, list):
+        loaders = [loaders]
     # 複数のローダーを順番に回す
     for loader in loaders:
         if loader is None: continue
@@ -175,7 +225,7 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
     return total_loss / update_count if update_count > 0 else total_loss
 
 
-# trainer.py に追加
+
 
 def evaluate_model(model, val_loader, device, config, criterion=None, ema=None):
     """検証データでの損失を計算"""

@@ -9,7 +9,7 @@ from torch.cuda.amp import GradScaler
 from config import TrainingConfig
 from data_utils import create_dataloaders
 from model_utils import setup_model_and_tokenizer, FocalLoss, EMA, freeze_encoder_layers
-from trainer import LRFinder, EarlyStopping, get_total_steps, train_epoch,evaluate_model
+from trainer import LRFinder, EarlyStopping, get_total_steps,get_phase_loaders, train_epoch,evaluate_model,InterleavedLoaders
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,19 +78,16 @@ def run_training(config: TrainingConfig):
 
     for phase_idx, n_epochs in enumerate(config.phase_epochs):
         if n_epochs <= 0: continue
+        if phase_idx == 2:
+            logger.info("🔒 PHASE 3: Re-freezing Encoder to protect grammar...")
+            # Encoderを完全に固定
+            encoder = model.get_encoder()
+            for param in encoder.parameters():
+                param.requires_grad = False
+        phase_names = ["Base Training", "Contextual Training", "Domain Specialization"]
+        logger.info(f"--- PHASE {phase_idx+1}: {phase_names[phase_idx]} ---")
         
-        # フェーズごとのローダー選択 (ここでもアンカーデータを保証)
-        if phase_idx == 0:
-            phase_loaders = [loaders_map["span"], loaders_map["bywork"]]
-            logger.info("--- PHASE 1: Base Training ---")
-        elif phase_idx == 1:
-            phase_loaders = [loaders_map["chunk"], loaders_map["bywork"], loaders_map["span"]]
-            logger.info("--- PHASE 2: Contextual Training ---")
-        else:
-            # Phase 3: 本命データ + アンカー(span)を混ぜて忘却防止
-            phase_loaders = [loaders_map["practical_chunk"], loaders_map["practical_line"], loaders_map["span"]]
-            logger.info("--- PHASE 3: Domain Specialization (with Anchor) ---")
-
+        phase_loaders = get_phase_loaders(phase_idx, loaders_map)
         for epoch in range(n_epochs):
             # 1エポック学習
             avg_loss = train_epoch(model, phase_loaders, optimizer, scheduler, scaler, device, config, epoch, criterion, ema)

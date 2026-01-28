@@ -18,12 +18,12 @@ class TrainingConfig:
     
     # --- 3-Phase 学習制御 ---
     # [Phase1(基礎), Phase2(文脈), Phase3(本命特化)]
-    phase_epochs: List[int] = field(default_factory=lambda: [1, 1, 1])
+    phase_epochs: List[int] = field(default_factory=lambda: [2, 1, 1])
     # Phase3で一般知識を忘れないためのアップサンプリング調整
-    practical_upsample: int = 2 
+    practical_upsample: int = 1 
     
     # --- ハイパーパラメータ ---
-    epochs: int = 3 # phase_epochsの合計と一致させる
+    epochs: int = 4 # phase_epochsの合計と一致させる
     batch_size: int = 16
     accumulation_steps: int = 2
     learning_rate: float = 5e-5
