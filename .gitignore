@@ -1,1 +1,13 @@
 experiment/mock_output_complete/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large model weights and logs
+models/
+mock_output_complete/
+lr_finder_plot.png
+
+# Environment
+.venv/
+.env
