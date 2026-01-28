@@ -472,8 +472,11 @@ def load_datasets_balanced(file_paths, file_types, max_samples_per_type=None, ra
             span_files.append((fp, en_list, ja_list))
         elif ftype in (1, 2):
             logger.info(f"\n🎯 [WORK-LEVEL] {fp} (type={ftype})")
-            en_list, ja_list = load_single_dataset_streaming(fp, max_samples=None, random_seed=random_seed, tag=tag)
+            # ftype=1 (文学一般) の場合は max_samples を適用し、ftype=2 (本命) は全件ロードする
+            sample_limit = max_samples_per_type if ftype == 1 else None
+            en_list, ja_list = load_single_dataset_streaming(fp, max_samples=sample_limit, random_seed=random_seed, tag=tag)
             bywork_files.append((fp, en_list, ja_list))
+            # チャンク読み込みは元のファイルから行う（ここはそのまま）
             chunk_en_list, chunk_ja_list = load_chunks_from_file(fp, tag=tag)
             bywork_chunk_files.append((fp, chunk_en_list, chunk_ja_list))
         else:
@@ -555,25 +558,22 @@ class TranslationDatasetRandomSpan(Dataset):
 
 
 class TranslationDatasetByWork(Dataset):
-    """ByWork系データ用Dataset（行単位）"""
     def __init__(self, en_texts, ja_texts, tokenizer, max_len=64):
         self.en_texts = en_texts
         self.ja_texts = ja_texts
         self.tokenizer = tokenizer
         self.max_len = max_len
 
-    def __len__(self):
-        return len(self.en_texts)
+    def __len__(self): return len(self.en_texts)
 
     def __getitem__(self, idx):
-        en_text = self.en_texts[idx]
-        ja_text = self.ja_texts[idx]
-        
+        en_text, ja_text = self.en_texts[idx], self.ja_texts[idx]
         if hasattr(self.tokenizer, 'supported_language_codes'):
             en_text = ">>jap<< " + en_text
-
-        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding="max_length")
-        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding="max_length")
+        
+        # padding=False にして、生のリボンのまま返す
+        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding=False)
+        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding=False)
 
         return {
             "input_ids": inputs["input_ids"],
@@ -581,38 +581,28 @@ class TranslationDatasetByWork(Dataset):
             "labels": labels["input_ids"]
         }
 
-
 class TranslationDatasetByWorkChunk(Dataset):
-    """
-    🆕 ByWork系データ用Dataset（チャンク単位）
-    
-    区切り行で分割された作品チャンク全体を結合した大きな翻訳ペアとして学習
-    """
     def __init__(self, en_chunks, ja_chunks, tokenizer, max_len=512):
         self.en_chunks = en_chunks
         self.ja_chunks = ja_chunks
         self.tokenizer = tokenizer
-        self.max_len = max_len  # チャンクは長いので大きめのmax_len
+        self.max_len = max_len
 
-    def __len__(self):
-        return len(self.en_chunks)
+    def __len__(self): return len(self.en_chunks)
 
     def __getitem__(self, idx):
-        en_text = self.en_chunks[idx]
-        ja_text = self.ja_chunks[idx]
-        
+        en_text, ja_text = self.en_chunks[idx], self.ja_chunks[idx]
         if hasattr(self.tokenizer, 'supported_language_codes'):
             en_text = ">>jap<< " + en_text
 
-        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding="max_length")
-        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding="max_length")
+        inputs = self.tokenizer(en_text, max_length=self.max_len, truncation=True, padding=False)
+        labels = self.tokenizer(ja_text, max_length=self.max_len, truncation=True, padding=False)
 
         return {
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
             "labels": labels["input_ids"]
         }
-
 
 # ===============================
 # 3. Early Stopping
@@ -707,8 +697,15 @@ def setup_training(config: TrainingConfig):
     
     logger.info(f"🔧 Device: {device}")
     
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    
+    # 【修正】torch_dtype=torch.float16 を削除し、デフォルト(FP32)で読み込む
+    # GradScalerを使う場合、重みはFP32である必要があります。
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        config.model_name,
+        # torch_dtype=torch.float16,  <-- 削除
+        use_safetensors=True
+    ).to(device)
     
     # 🆕 Label Smoothingの設定
     if config.use_label_smoothing:
@@ -809,22 +806,53 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
     logger.info(f"📊 Train: {len(train_dataset)} samples, Validation: {len(val_dataset)} samples")
 
     # 元のコードに倣って RandomSpan / ByWork のインデックスを計算
+    # ==========================================
+    # 🛠️ 修正・デバッグ版インデックス振り分け処理
+    # ==========================================
+    logger.info("⚙️ Starting index filtering... (This might take a moment)")
+
     span_indices = []
     bywork_indices = []
     offset = 0
-    for ds in dataset.datasets:
+    
+    # データセットの構成をスキャン
+    for i, ds in enumerate(dataset.datasets):
         ds_len = len(ds)
+        # 型判定
         if isinstance(ds, TranslationDatasetRandomSpan):
             span_indices.extend(range(offset, offset + ds_len))
         elif isinstance(ds, TranslationDatasetByWork):
             bywork_indices.extend(range(offset, offset + ds_len))
+        # Chunkなど他の型があればここに追加
+        elif isinstance(ds, TranslationDatasetByWorkChunk):
+            # ChunkはPracticalでなければByWork扱いにするか、除外するかなど
+            # 今回のロジックでは train_bywork に含める運用であれば以下
+            bywork_indices.extend(range(offset, offset + ds_len))
+            
         offset += ds_len
 
-    train_span_indices = [i for i in train_dataset.indices] if hasattr(train_dataset, 'indices') else []
-    train_bywork_indices = [i for i in train_dataset.indices] if hasattr(train_dataset, 'indices') else []
-    # 上の二つはフィルタをかけて分離する（元のロジック）
-    train_span_indices = [i for i in train_dataset.indices if i in span_indices] if hasattr(train_dataset, 'indices') else []
-    train_bywork_indices = [i for i in train_dataset.indices if i in bywork_indices] if hasattr(train_dataset, 'indices') else []
+    logger.info(f"  - Total Span indices: {len(span_indices)}")
+    logger.info(f"  - Total ByWork indices: {len(bywork_indices)}")
+
+    # ⚠️ 【重要】高速化のため必ず set に変換する (O(N) -> O(1))
+    span_index_set = set(span_indices)
+    bywork_index_set = set(bywork_indices)
+    
+    logger.info("  - Converted to sets for fast lookup.")
+
+    # Trainデータセット内のインデックスを振り分け
+    # train_dataset.indices は Subset が持つ元のインデックスリスト
+    if hasattr(train_dataset, 'indices'):
+        current_indices = train_dataset.indices
+    else:
+        # random_splitされなかった場合など
+        current_indices = list(range(len(train_dataset)))
+
+    train_span_indices = [i for i in current_indices if i in span_index_set]
+    train_bywork_indices = [i for i in current_indices if i in bywork_index_set]
+
+    logger.info(f"✅ Filtering completed. Train Span: {len(train_span_indices)}, Train ByWork: {len(train_bywork_indices)}")
+    # ==========================================[]
 
     train_span = Subset(dataset, train_span_indices)
     train_bywork = Subset(dataset, train_bywork_indices)
@@ -840,21 +868,48 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
         train_chunk_dataset = None
         val_chunk_dataset = None
 
-    # Practical datasets の Train/Val 分割（もしあれば）
+    # ==========================================
+    # 🛠️ Practicalデータの分割とアップサンプリング
+    # ==========================================
+    # Practical (Line)
     if practical_line_datasets:
         practical_line_dataset = ConcatDataset([ds for _, ds in practical_line_datasets])
-        p_line_val_size = int(len(practical_line_dataset) * config.val_split)
+        p_line_val_size = max(1, int(len(practical_line_dataset) * config.val_split)) # 最低1件は確保
         p_line_train_size = len(practical_line_dataset) - p_line_val_size
-        train_practical_line, val_practical_line = random_split(practical_line_dataset, [p_line_train_size, p_line_val_size])
+        
+        train_practical_line_base, val_practical_line = random_split(
+            practical_line_dataset, 
+            [p_line_train_size, p_line_val_size],
+            generator=torch.Generator().manual_seed(config.random_seed)
+        )
+        
+        # 【修正】データが少なすぎるため、Trainデータだけ20倍に複製（Upsampling）する
+        # これにより 300件 -> 6000件 相当になり、1epochでしっかり学習できる
+        upsample_factor = 5
+        logger.info(f"⚡ Upsampling Practical (Line) train data by {upsample_factor}x")
+        train_practical_line = ConcatDataset([train_practical_line_base] * upsample_factor)
+        
     else:
         train_practical_line = None
         val_practical_line = None
 
+    # Practical (Chunk)
     if practical_chunk_datasets:
         practical_chunk_dataset = ConcatDataset([ds for _, ds in practical_chunk_datasets])
-        p_chunk_val_size = int(len(practical_chunk_dataset) * config.val_split)
+        p_chunk_val_size = max(1, int(len(practical_chunk_dataset) * config.val_split))
         p_chunk_train_size = len(practical_chunk_dataset) - p_chunk_val_size
-        train_practical_chunk, val_practical_chunk = random_split(practical_chunk_dataset, [p_chunk_train_size, p_chunk_val_size])
+        
+        train_practical_chunk_base, val_practical_chunk = random_split(
+            practical_chunk_dataset, 
+            [p_chunk_train_size, p_chunk_val_size],
+            generator=torch.Generator().manual_seed(config.random_seed)
+        )
+        
+        # 【修正】Chunkデータも同様に20倍にする
+        upsample_factor = 20
+        logger.info(f"⚡ Upsampling Practical (Chunk) train data by {upsample_factor}x")
+        train_practical_chunk = ConcatDataset([train_practical_chunk_base] * upsample_factor)
+        
     else:
         train_practical_chunk = None
         val_practical_chunk = None
@@ -870,7 +925,8 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
     }
 
     actual_batch_size = config.batch_size
-    bywork_batch_size = max(1, config.batch_size // 4)
+    # 文学データ(ByWork)のバッチサイズを 4分の1 から 2分の1 に引き上げ（4 -> 16相当）
+    bywork_batch_size = max(1, config.batch_size // 2) 
     chunk_batch_size = max(1, config.batch_size // 8)
 
     train_loaders = []
@@ -895,6 +951,7 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
             train_bywork,
             batch_size=bywork_batch_size,
             shuffle=True,
+            collate_fn=span_collator,
             **loader_args
         )
         train_loaders.append(train_loader_bywork)
@@ -908,6 +965,7 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
             train_chunk_dataset,
             batch_size=chunk_batch_size,
             shuffle=True,
+            collate_fn=span_collator,
             **loader_args
         )
         train_loaders.append(train_loader_chunk)
@@ -921,6 +979,7 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
             train_practical_line,
             batch_size=bywork_batch_size,
             shuffle=True,
+            collate_fn=span_collator,
             **loader_args
         )
         logger.info(f"✅ Practical (line) loader: {len(train_practical_line)} samples, batch_size={bywork_batch_size}")
@@ -932,6 +991,7 @@ def create_dataloaders(config: TrainingConfig, tokenizer):
             train_practical_chunk,
             batch_size=chunk_batch_size,
             shuffle=True,
+            collate_fn=span_collator,
             **loader_args
         )
         logger.info(f"✅ Practical (chunk) loader: {len(train_practical_chunk)} chunks, batch_size={chunk_batch_size}")
@@ -1041,7 +1101,11 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
     """1エポック分の学習処理"""
     model.train()
     total_loss = 0
+    
+    # BF16が使えるか確認
     use_bf16 = config.use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
+    # AMPを使うか確認（BF16が使えなくても、FP16でAMPをする場合がある）
+    use_amp = config.use_amp and device.type == "cuda"
 
     for loader in loaders:
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
@@ -1055,21 +1119,20 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
             
             loss_divisor = config.accumulation_steps
             
+            
             if use_bf16:
-                with autocast(device_type='cuda', dtype=torch.bfloat16):
+                with autocast( dtype=torch.bfloat16):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    
-                    if criterion is not None:
-                        loss = criterion(outputs.logits, labels) / loss_divisor
-                    else:
-                        loss = outputs.loss / loss_divisor
-            else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = (criterion(outputs.logits, labels) if criterion else outputs.loss) / loss_divisor
+            elif use_amp:
                 
-                if criterion is not None:
-                    loss = criterion(outputs.logits, labels) / loss_divisor
-                else:
-                    loss = outputs.loss / loss_divisor
+                with autocast( dtype=torch.float16):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = (criterion(outputs.logits, labels) if criterion else outputs.loss) / loss_divisor
+            else:
+                # AMPなし（FP32）
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = (criterion(outputs.logits, labels) if criterion else outputs.loss) / loss_divisor
 
             if scaler:
                 scaler.scale(loss).backward()
@@ -1219,9 +1282,8 @@ def train_model(config: TrainingConfig):
                 practical_candidate.append(practical_chunk_loader)
             if practical_line_loader is not None:
                 practical_candidate.append(practical_line_loader)
-            if not practical_candidate:
-                logger.info("No practical loaders found; skipping Phase 3.")
-                continue
+            if span_loader is not None:
+                practical_candidate.append(span_loader)
             phase_loaders = practical_candidate
             logger.info(f"--- PHASE 3 (practical-focused) : {n_epochs} epochs ---")
 
@@ -1426,7 +1488,7 @@ if __name__ == "__main__":
     
     else:
         files = [
-            "./../lyrics_dataset.jsonl"
+            "./../data/lyrics_dataset.jsonl",
             "./../data/separated_literary_dataset.jsonl",
             "./../data/OpenSubtitles_sample_40000.jsonl",
             "./../data/TED_sample_40000.jsonl",
@@ -1438,27 +1500,27 @@ if __name__ == "__main__":
             model_name="Helsinki-NLP/opus-mt-en-jap",
             file_paths=files,
             file_types = file_values,
-            epochs=5,
-            phase_epochs=[3,1,1],
+            epochs=3,
+            phase_epochs=[1,1,1],
             batch_size=16,
-            max_samples_per_span_file=40000,
+            max_samples_per_span_file=30000,
             save_dir="./models/translation_model_complete",
             random_seed=42,
             num_workers=4,
-            learning_rate=3e-4,
+            learning_rate=5e-5,
             weight_decay=0.01,
-            accumulation_steps=4,
+            accumulation_steps=2,
             use_bfloat16=True,
             scheduler_type='onecycle',
             # 🆕 新機能を有効化
-            use_focal_loss=True,
+            use_focal_loss=False,
             focal_alpha=0.25,
             focal_gamma=2.0,
             use_label_smoothing=True,
             label_smoothing=0.1,
             use_ema=True,
             ema_decay=0.9999,
-            use_lr_finder=True,
+            use_lr_finder=False,
             lr_finder_min=1e-7,
             lr_finder_max=1e-2,
             lr_finder_num_iter=100
