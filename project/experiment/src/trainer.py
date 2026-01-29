@@ -1,11 +1,10 @@
-import os
 import torch
-import torch.nn as nn
 from tqdm import tqdm
 import logging
 import matplotlib.pyplot as plt
 import matplotlib
 import random
+
 # ヘッドレス環境（サーバー等）でのプロットエラー防止
 matplotlib.use('Agg')
 
@@ -75,7 +74,11 @@ class LRFinder:
         self.model.load_state_dict(original_weights)
         self.optimizer.load_state_dict(original_opt_state)
         
-        suggested_lr = self.history['lr'][self.history['loss'].index(min(self.history['loss']))] // 10
+        if self.history['loss']:
+            suggested_lr = self.history['lr'][self.history['loss'].index(min(self.history['loss']))] // 10
+        else:
+            suggested_lr = min_lr
+            
         logger.info(f"✅ Suggested LR: {suggested_lr:.2e}")
         return suggested_lr
 
@@ -107,40 +110,7 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience: self.early_stop = True
 
-
-
-def get_phase_loaders(phase_idx, loaders_map):
-    """
-    フェーズごとのローダーリスト（またはインターリーブ）を返す。
-    ここを1箇所書き換えるだけで、予測と実行の両方が同時に変わる。
-    """
-    if phase_idx == 0:
-        # Phase 1: 基礎
-        return [loaders_map["span"], loaders_map["bywork"]]
-    elif phase_idx == 1:
-        # Phase 2: 文脈
-        return [loaders_map["chunk"], loaders_map["bywork"], loaders_map["span"]]
-    else:
-        # Phase 3: 本命（インターリーブ）
-        p3_dict = {
-            "pc": loaders_map["practical_chunk"],
-            "pl": loaders_map["practical_line"],
-            "anchor": loaders_map["span"]
-        }
-        return [InterleavedLoaders(p3_dict, weights=[1.0, 1.0, 2.0])]
-
-def get_total_steps(phase_epochs, loaders_map, config):
-    total_updates = 0
-    for phase_idx, n_epochs in enumerate(phase_epochs):
-        if n_epochs <= 0: continue
-        
-        # 🆕 ここで共通関数を呼び出す
-        loaders = get_phase_loaders(phase_idx, loaders_map)
-        
-        phase_it = sum(len(l) for l in loaders if l is not None)
-        total_updates += (phase_it // config.accumulation_steps) * n_epochs
-    return total_updates
-#インターリーブ学習
+# インターリーブ学習
 class InterleavedLoaders:
     """
     複数のDataLoaderをバッチ単位で混ぜ合わせる。
@@ -176,6 +146,37 @@ class InterleavedLoaders:
     def __len__(self):
         # 全ローダーのバッチ数の合計
         return sum(len(v) for v in self.loaders.values())
+
+def get_phase_loaders(phase_idx, loaders_map):
+    """
+    フェーズごとのローダーリスト（またはインターリーブ）を返す。
+    """
+    if phase_idx == 0:
+        # Phase 1: 基礎
+        return [loaders_map["span"], loaders_map["bywork"]]
+    elif phase_idx == 1:
+        # Phase 2: 文脈
+        return [loaders_map["chunk"], loaders_map["bywork"], loaders_map["span"]]
+    else:
+        # Phase 3: 本命（インターリーブ）
+        p3_dict = {
+            "pc": loaders_map["practical_chunk"],
+            "pl": loaders_map["practical_line"],
+            "anchor": loaders_map["span"]
+        }
+        return [InterleavedLoaders(p3_dict, weights=[1.0, 1.0, 2.0])]
+
+def get_total_steps(phase_epochs, loaders_map, config):
+    total_updates = 0
+    for phase_idx, n_epochs in enumerate(phase_epochs):
+        if n_epochs <= 0: continue
+        
+        loaders = get_phase_loaders(phase_idx, loaders_map)
+        
+        phase_it = sum(len(l) for l in loaders if l is not None)
+        total_updates += (phase_it // config.accumulation_steps) * n_epochs
+    return total_updates
+
 # ===============================
 # 3. 学習コア
 # ===============================
@@ -185,6 +186,7 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
     update_count = 0
     if not isinstance(loaders, list):
         loaders = [loaders]
+        
     # 複数のローダーを順番に回す
     for loader in loaders:
         if loader is None: continue
@@ -195,7 +197,7 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            with torch.amp.autocast(device_type=device.type, enabled=config.use_amp):
+            with torch.cuda.amp.autocast(enabled=config.use_amp):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = (criterion(outputs.logits, labels) if criterion else outputs.loss) / config.accumulation_steps
 
@@ -216,6 +218,8 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
                 
                 optimizer.zero_grad(set_to_none=True)
                 if ema: ema.update()
+                
+                # Optimizerの更新後にSchedulerを進める（警告対策）
                 if scheduler: scheduler.step()
                 update_count += 1
 
@@ -223,8 +227,6 @@ def train_epoch(model, loaders, optimizer, scheduler, scaler, device, config, ep
             pbar.set_postfix(lr=f"{optimizer.param_groups[0]['lr']:.1e}", loss=f"{loss.item()*config.accumulation_steps:.4f}")
 
     return total_loss / update_count if update_count > 0 else total_loss
-
-
 
 
 def evaluate_model(model, val_loader, device, config, criterion=None, ema=None):
@@ -240,8 +242,8 @@ def evaluate_model(model, val_loader, device, config, criterion=None, ema=None):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             
-            # CPU/GPU 警告を回避した autocast
-            with torch.amp.autocast(device_type=device.type, enabled=config.use_amp and device.type == 'cuda'):
+            # 修正: torch.amp ではなく torch.cuda.amp を使用（Jetson互換性）
+            with torch.cuda.amp.autocast(enabled=config.use_amp and device.type == 'cuda'):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = (criterion(outputs.logits, labels) if criterion else outputs.loss)
             

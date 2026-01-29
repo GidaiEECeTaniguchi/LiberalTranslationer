@@ -4,7 +4,7 @@ from typing import List, Optional
 @dataclass
 class TrainingConfig:
     # --- モデル設定 ---
-    model_name: str = "Helsinki-NLP/opus-mt-en-jap"
+    model_name: str = "Helsinki-NLP/opus-tatoeba-en-ja"
     save_dir: str = "./models/translation_v2"
     max_len: int = 128
     
@@ -13,13 +13,13 @@ class TrainingConfig:
     # 0=Span(一般), 1=ByWork(文学/コンテキスト), 2=Practical(本命/歌詞等)
     file_types: List[int] = field(default_factory=list)
     tags: Optional[List[str]] = None
-    max_samples_per_span_file: int = 30000
+    max_samples_per_span_file: int = 40000
     val_split: float = 0.05
     
     # --- 3-Phase 学習制御 ---
     # [Phase1(基礎), Phase2(文脈), Phase3(本命特化)]
     phase_epochs: List[int] = field(default_factory=lambda: [2, 1, 1])
-    # Phase3で一般知識を忘れないためのアップサンプリング調整
+    # Phase3のアップサンプリング調整
     practical_upsample: int = 1 
     
     # --- ハイパーパラメータ ---

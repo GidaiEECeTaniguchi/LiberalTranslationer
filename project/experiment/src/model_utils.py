@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
+from transformers import MarianTokenizer
 logger = logging.getLogger(__name__)
 
 # ===============================
@@ -103,7 +103,21 @@ def setup_model_and_tokenizer(config, device):
     """
     モデルとトークナイザーをロードし、初期設定を行う
     """
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    try:
+    # 1. まずはMarian専用トークナイザーでロードを試みる
+        tokenizer = MarianTokenizer.from_pretrained(config.model_name)
+    except Exception:
+    # 2. ダメならAutoTokenizerに戻す（保険）
+        logger.warning("⚠️ Failed to load MarianTokenizer, falling back to AutoTokenizer.")
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name, 
+    use_fast=False,   # sentencepieceを確実に使うため、あえてFalseに
+    trust_remote_code=True)
+
+# 重要：正しい言語コードを教える（MarianMTはここが肝！）
+# opus-mt-en-jap の場合、ソースは 'en', ターゲットは 'ja' (または 'jpn') だが、
+# MarianTokenizerは自動判定してくれることが多い。念のため確認ログを出す。
+    logger.info(f"🧩 Tokenizer Vocab Size: {tokenizer.vocab_size}")
+    
     
     # FP32でロード (GradScaler/AMPで動的に制御するため)
     model = AutoModelForSeq2SeqLM.from_pretrained(

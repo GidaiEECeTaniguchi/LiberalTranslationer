@@ -48,25 +48,31 @@ def run_training(config: TrainingConfig):
         config.learning_rate = suggested_lr
         for pg in optimizer.param_groups: pg['lr'] = suggested_lr
 
-    # 6. スケジューラ設定 (ここが修正の肝: 正確な合計ステップ数)
+    # 6. スケジューラ設定
     total_steps = get_total_steps(config.phase_epochs, loaders_map, config)
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=config.learning_rate * 5, # 10倍は高すぎるため5倍に抑制
+        max_lr=config.learning_rate * 5, 
         total_steps=total_steps,
-        pct_start=0.1, # ウォームアップを短めにして適応を早める
+        pct_start=0.3, # ウォームアップ長め推奨
         anneal_strategy='cos',
         div_factor=25.0,
         final_div_factor=1e4
     )
     logger.info(f"📈 Scheduler initialized with {total_steps} steps.")
 
-    # 7. その他のツール
-    criterion = FocalLoss(alpha=config.focal_alpha, gamma=config.focal_gamma) if config.use_focal_loss else None
+    # 7. 損失関数とツール (FocalLossを使わない場合は標準のCrossEntropyを使う)
+    if config.use_focal_loss:
+        criterion = FocalLoss(alpha=config.focal_alpha, gamma=config.focal_gamma)
+    else:
+        # Noneだとエラーになる可能性があるので、標準を設定
+        criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
     ema = EMA(model, decay=config.ema_decay) if config.use_ema else None
     if ema: ema.register()
     
-    scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp and device.type == "cuda")
+    # Jetson/Older PyTorch compatibility
+    scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp and device.type == "cuda")
     early_stopping = EarlyStopping(patience=config.patience)
     
     # 初期凍結
@@ -78,43 +84,51 @@ def run_training(config: TrainingConfig):
 
     for phase_idx, n_epochs in enumerate(config.phase_epochs):
         if n_epochs <= 0: continue
+        
+        # Phase 3: Encoder再凍結
         if phase_idx == 2:
             logger.info("🔒 PHASE 3: Re-freezing Encoder to protect grammar...")
-            # Encoderを完全に固定
             encoder = model.get_encoder()
             for param in encoder.parameters():
                 param.requires_grad = False
+        
         phase_names = ["Base Training", "Contextual Training", "Domain Specialization"]
         logger.info(f"--- PHASE {phase_idx+1}: {phase_names[phase_idx]} ---")
         
         phase_loaders = get_phase_loaders(phase_idx, loaders_map)
+        
         for epoch in range(n_epochs):
             # 1エポック学習
             avg_loss = train_epoch(model, phase_loaders, optimizer, scheduler, scaler, device, config, epoch, criterion, ema)
             
-            # 特定タイミングで凍結解除
+            # Phase 1 の最初のEpoch終わりで凍結解除
             if phase_idx == 0 and epoch == 0:
                 for p in model.parameters(): p.requires_grad = True
                 logger.info("🔓 Model fully unfrozen.")
 
-            # バリデーション (簡易化のためここでは省略。必要に応じて追加)
-            # if val_loss < best_val_loss: save_model(...)
-            if loaders_map.get("val"): # valローダーがある場合
+            # === バリデーション & ベストモデル保存 (ここが重要！) ===
+            if loaders_map.get("val"): 
+                logger.info("⏳ Running Validation...")
                 val_loss = evaluate_model(model, loaders_map["val"], device, config, criterion, ema)
-                logger.info(f"📊 Epoch {epoch+1} Val Loss: {val_loss:.4f}")
+                logger.info(f"📊 Phase {phase_idx+1} - Epoch {epoch+1} Val Loss: {val_loss:.4f}")
 
-                # ベストモデルの保存
+                # ベストモデルの更新チェック
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_path = os.path.join(config.save_dir, "best_model")
+                    
+                    # 保存 (EMAがある場合はEMAの重みを適用して保存するのが理想だが、
+                    # ここでは簡単のため、現在のモデルを保存。evaluate_model内でEMA適用してるならOK)
                     model.save_pretrained(best_path)
                     tokenizer.save_pretrained(best_path)
-                    logger.info(f"🏆 New best model saved (loss: {val_loss:.4f})")
-            
+                    logger.info(f"🏆 New best model saved to {best_path} (loss: {val_loss:.4f})")
+            else:
+                logger.warning("⚠️ No validation loader found. Skipping validation.")
+
     logger.info("✅ Training Finished.")
+    # 最終モデルの保存
     model.save_pretrained(os.path.join(config.save_dir, "final_model"))
     tokenizer.save_pretrained(os.path.join(config.save_dir, "final_model"))
-
 if __name__ == "__main__":
     # 設定例
     cfg = TrainingConfig(
@@ -123,13 +137,16 @@ if __name__ == "__main__":
             "./../../data/separated_literary_dataset.jsonl",
             "./../../data/OpenSubtitles_sample_40000.jsonl",
             "./../../data/TED_sample_40000.jsonl",
-            "./../../data/Tatoeba_sample_40000.jsonl",
-            "./../../data/all_outenjp.jsonl"
+            "./../../data/Tatoeba_sample_40000.jsonl"
         ],
-        file_types=[2,1,0,0,0,0],
-        epochs=3,
-        phase_epochs=[1, 1, 1],
-        batch_size=8,
-        mock_mode=True
+        file_types=[2,1,0,0,0],
+        max_samples_per_span_file=40000,
+        practical_upsample=50,
+        epochs=6,
+        phase_epochs=[1, 2, 3],
+        batch_size=16,
+        mock_mode=False,
+        use_focal_loss= True,
+        use_lr_finder=False
     )
     run_training(cfg)
